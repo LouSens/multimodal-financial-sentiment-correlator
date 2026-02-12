@@ -1,0 +1,57 @@
+# ===================================================================== #
+#  Sentiprice Correlator — .gitignore
+# ===================================================================== #
+
+# ── Virtual Environment ──────────────────────────────────────────────
+venv/
+.venv/
+env/
+.env/
+ENV/
+.conda/
+conda-env/
+
+# ── Python Cache ─────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# ── Data Files ───────────────────────────────────────────────────────
+*.csv
+news/
+sentiment_cache.csv
+
+# ── Model Artifacts ──────────────────────────────────────────────────
+checkpoints/
+*.pth
+*.joblib
+model_weights.pth
+scaler.joblib
+
+# ── IDE / Editor ─────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Jupyter ──────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Distribution / Packaging ────────────────────────────────────────
+dist/
+build/
+*.egg-info/
+*.egg
+
+# ── Logs ─────────────────────────────────────────────────────────────
+*.log
+
+# ── OS Files ─────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+streamlit
+yfinance
+pandas
+numpy
+torch
+scikit-learn
+transformers
+vaderSentiment
+plotly
+tqdm
+joblib
