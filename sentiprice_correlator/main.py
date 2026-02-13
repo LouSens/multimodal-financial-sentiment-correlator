@@ -146,15 +146,21 @@ def load_ticker_model(ticker: str, device: torch.device):
         ckpt_path = paths["checkpoint"]
         scaler_path = paths["scaler"]
 
-    # Load model
-    model = MultiModalNet()
+    # Load checkpoint and read config FIRST (to get architecture params)
     checkpoint = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.to(device).eval()
     config = checkpoint.get("config", {})
 
-    # Load scaler
-    processor = DataPreprocessor()
+    # Build model with MATCHING architecture from training config
+    model = MultiModalNet(
+        hidden_dim=config.get("hidden_dim", 64),
+        num_layers=config.get("num_layers", 2),
+        dropout=config.get("dropout", 0.3),
+    )
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.to(device).eval()
+
+    # Load scaler + set matching seq_length from training
+    processor = DataPreprocessor(seq_length=config.get("seq_length", 24))
     if os.path.exists(scaler_path):
         processor.load_scaler(scaler_path)
     else:

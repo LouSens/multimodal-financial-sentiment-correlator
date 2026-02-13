@@ -1,22 +1,23 @@
 """
-dashboard.py — Production-Ready Streamlit Dashboard
+dashboard.py — Premium Streamlit Dashboard for Sentiprice Correlator
 
 Features
 ────────
-  • Dark-themed, glassmorphism UI with premium aesthetics
-  • Real-time backend health monitoring
+  • Polished dark-themed UI with glassmorphism cards
+  • Persistent sidebar: API health, ticker controls, model info, tuning results
   • 4 animated KPI metric cards (price, prediction, change, sentiment)
   • Dual-axis chart: Price + Sentiment overlay
   • Volume bar chart
-  • Model info panel
-  • Downloadable raw data
-  • Full API integration (/health, /predict, /history, /model/info)
+  • Summary statistics and downloadable raw data
+  • Full API integration (/health, /predict, /history, /model/info, /models)
 
 Run
 ───
   streamlit run dashboard.py
 """
 
+import os
+import json
 import streamlit as st
 import requests
 import pandas as pd
@@ -38,46 +39,103 @@ st.set_page_config(
 #  API Config
 # ===================================================================== #
 API_BASE = "http://127.0.0.1:8000"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TUNING_DIR = os.path.join(BASE_DIR, "tuning_results")
 
 # ===================================================================== #
-#  Custom CSS — Dark Theme + Glassmorphism
+#  Custom CSS — Dark Theme + Glassmorphism (Streamlit 1.32+ compatible)
 # ===================================================================== #
 st.markdown("""
 <style>
-    /* ── Import Google Font ─────────────────────────────────────── */
+    /* ── Import Google Font + Material Symbols ──────────────────── */
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200');
 
-    /* ── Global ─────────────────────────────────────────────────── */
-    html, body, [class*="css"] {
-        font-family: 'Inter', sans-serif;
+    /* ── Fix Material Icons rendering as text ──────────────────── */
+    .material-symbols-rounded,
+    [data-testid="stSidebar"] button[kind="header"] span,
+    .st-emotion-cache-1pbsqtx {
+        font-family: 'Material Symbols Rounded' !important;
+        font-size: 24px !important;
+        -webkit-font-smoothing: antialiased;
+    }
+
+    /* ── Hide sidebar collapse arrow text fallback ─────────────── */
+    [data-testid="collapsedControl"],
+    [data-testid="stSidebarCollapsedControl"] {
+        font-size: 0 !important;
+        color: transparent !important;
+    }
+    [data-testid="collapsedControl"] svg,
+    [data-testid="stSidebarCollapsedControl"] svg {
+        font-size: 24px !important;
+        color: rgba(255, 255, 255, 0.6) !important;
+    }
+
+    /* ── Global Font (Exclude Material Icons) ───────────────────── */
+    html, body, .stApp {
+        font-family: 'Inter', sans-serif !important;
+    }
+    
+    /* Apply Inter to all elements EXCEPT those that use icon fonts */
+    .stApp > header, .stApp > .main .block-container, .stApp > footer {
+        font-family: 'Inter', sans-serif !important;
+    }
+    
+    /* Ensure Material Icons use the correct font family */
+    .material-symbols-rounded, 
+    .material-icons,
+    [data-testid="stSidebar"] button[kind="header"] span,
+    [data-testid="stExpander"] summary span,
+    [data-testid="stExpander"] svg,
+    .st-emotion-cache-1pbsqtx,
+    i {
+        font-family: 'Material Symbols Rounded', 'Material Icons' !important;
+        font-weight: normal;
+        font-style: normal;
+        line-height: 1;
+        letter-spacing: normal;
+        text-transform: none;
+        white-space: nowrap;
+        word-wrap: normal;
+        direction: ltr;
+        -webkit-font-feature-settings: 'liga';
+        -webkit-font-smoothing: antialiased;
     }
 
     .main .block-container {
-        padding-top: 2rem;
+        padding-top: 1.5rem;
         padding-bottom: 2rem;
         max-width: 1400px;
+    }
+
+    /* ── Custom HR divider (replaces st.divider) ────────────────── */
+    .custom-divider {
+        border: none;
+        border-top: 1px solid rgba(255, 255, 255, 0.08);
+        margin: 0.8rem 0;
     }
 
     /* ── Header Gradient Bar ────────────────────────────────────── */
     .header-bar {
         background: linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%);
         border-radius: 16px;
-        padding: 2rem 2.5rem;
-        margin-bottom: 2rem;
+        padding: 1.8rem 2.2rem;
+        margin-bottom: 1.5rem;
         border: 1px solid rgba(255, 255, 255, 0.08);
         box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
     }
     .header-bar h1 {
         color: #ffffff;
-        font-size: 2rem;
+        font-size: 1.8rem;
         font-weight: 700;
         margin: 0;
         letter-spacing: -0.5px;
     }
     .header-bar p {
-        color: rgba(255, 255, 255, 0.6);
-        font-size: 0.95rem;
-        margin-top: 0.4rem;
+        color: rgba(255, 255, 255, 0.55);
+        font-size: 0.9rem;
+        margin-top: 0.35rem;
         margin-bottom: 0;
     }
 
@@ -103,39 +161,45 @@ st.markdown("""
         backdrop-filter: blur(12px);
         border: 1px solid rgba(255, 255, 255, 0.08);
         border-radius: 16px;
-        padding: 1.5rem;
+        padding: 1.3rem 1rem;
         text-align: center;
         transition: transform 0.2s ease, box-shadow 0.2s ease;
+        min-height: 140px;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
     }
     .metric-card:hover {
         transform: translateY(-4px);
         box-shadow: 0 12px 40px rgba(79, 70, 229, 0.15);
     }
     .metric-label {
-        color: rgba(255, 255, 255, 0.5);
-        font-size: 0.8rem;
-        font-weight: 500;
+        color: rgba(255, 255, 255, 0.45);
+        font-size: 0.72rem;
+        font-weight: 600;
         text-transform: uppercase;
-        letter-spacing: 1px;
-        margin-bottom: 0.5rem;
+        letter-spacing: 1.2px;
+        margin-bottom: 0.4rem;
     }
     .metric-value {
-        font-size: 2rem;
+        font-size: 1.8rem;
         font-weight: 700;
-        margin-bottom: 0.3rem;
+        margin-bottom: 0.25rem;
+        line-height: 1.2;
     }
     .metric-delta {
-        font-size: 0.85rem;
+        font-size: 0.82rem;
         font-weight: 500;
     }
     .delta-positive { color: #34d399; }
     .delta-negative { color: #f87171; }
-    .delta-neutral { color: #fbbf24; }
+    .delta-neutral  { color: #fbbf24; }
     .color-white { color: #ffffff; }
     .color-green { color: #34d399; }
-    .color-red { color: #f87171; }
-    .color-blue { color: #60a5fa; }
+    .color-red   { color: #f87171; }
+    .color-blue  { color: #60a5fa; }
     .color-amber { color: #fbbf24; }
+    .color-purple { color: #a78bfa; }
 
     /* ── Status Dot ─────────────────────────────────────────────── */
     .status-dot {
@@ -144,38 +208,89 @@ st.markdown("""
         height: 10px;
         border-radius: 50%;
         margin-right: 6px;
-        animation: pulse 2s ease-in-out infinite;
+        animation: pulse-dot 2s ease-in-out infinite;
     }
     .status-online { background: #34d399; box-shadow: 0 0 8px #34d399; }
     .status-offline { background: #f87171; box-shadow: 0 0 8px #f87171; }
-    @keyframes pulse {
+    @keyframes pulse-dot {
         0%, 100% { opacity: 1; }
-        50% { opacity: 0.5; }
+        50% { opacity: 0.4; }
     }
 
     /* ── Section Title ──────────────────────────────────────────── */
     .section-title {
         color: #ffffff;
-        font-size: 1.2rem;
+        font-size: 1.15rem;
         font-weight: 600;
         margin-bottom: 1rem;
         padding-bottom: 0.5rem;
         border-bottom: 1px solid rgba(255, 255, 255, 0.08);
     }
 
-    /* ── Sidebar ────────────────────────────────────────────────── */
-    section[data-testid="stSidebar"] {
-        background: rgba(15, 12, 41, 0.95);
-        border-right: 1px solid rgba(255, 255, 255, 0.06);
+    /* ── Sidebar Styling ───────────────────────────────────────── */
+    [data-testid="stSidebar"] {
+        background: linear-gradient(180deg, rgba(15, 12, 41, 0.98) 0%, rgba(36, 36, 62, 0.98) 100%) !important;
+        border-right: 1px solid rgba(255, 255, 255, 0.06) !important;
     }
-    section[data-testid="stSidebar"] .block-container {
-        padding-top: 2rem;
+    [data-testid="stSidebar"] > div:first-child {
+        padding-top: 1.5rem;
     }
 
-    /* ── Hide default Streamlit elements ────────────────────────── */
-    #MainMenu { visibility: hidden; }
-    footer { visibility: hidden; }
-    header { visibility: hidden; }
+    /* ── Sidebar Section Box ──────────────────────────────────── */
+    .sidebar-section {
+        background: rgba(255, 255, 255, 0.03);
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        border-radius: 12px;
+        padding: 0.9rem;
+        margin-bottom: 0.8rem;
+    }
+    .sidebar-section-title {
+        color: rgba(255, 255, 255, 0.4);
+        font-size: 0.68rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 1.5px;
+        margin-bottom: 0.5rem;
+    }
+
+    /* ── Tuning Result Badges ──────────────────────────────────── */
+    .tuning-stat {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 0.3rem 0;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+    }
+    .tuning-stat:last-child { border-bottom: none; }
+    .tuning-stat-label {
+        color: rgba(255, 255, 255, 0.5);
+        font-size: 0.78rem;
+    }
+    .tuning-stat-value {
+        color: #ffffff;
+        font-size: 0.82rem;
+        font-weight: 600;
+    }
+
+    /* ── Welcome Features Grid ─────────────────────────────────── */
+    .features-grid {
+        display: flex;
+        justify-content: center;
+        gap: 2.5rem;
+        flex-wrap: wrap;
+        margin-top: 1.5rem;
+    }
+    .feature-item {
+        text-align: center;
+        transition: transform 0.2s ease;
+    }
+    .feature-item:hover { transform: translateY(-3px); }
+    .feature-icon { font-size: 1.8rem; margin-bottom: 0.3rem; }
+    .feature-label {
+        color: rgba(255, 255, 255, 0.4);
+        font-size: 0.78rem;
+        font-weight: 500;
+    }
 
     /* ── Plotly chart container ──────────────────────────────────── */
     .chart-container {
@@ -185,12 +300,35 @@ st.markdown("""
         padding: 0.5rem;
         margin-bottom: 1rem;
     }
+
+    /* ── Footer ─────────────────────────────────────────────────── */
+    .app-footer {
+        text-align: center;
+        color: rgba(255, 255, 255, 0.2);
+        font-size: 0.72rem;
+        padding-top: 2rem;
+        border-top: 1px solid rgba(255, 255, 255, 0.04);
+        margin-top: 2rem;
+    }
+
+    /* ── Hide default Streamlit elements (safe subset) ──────────── */
+    #MainMenu { visibility: hidden; }
+    footer { visibility: hidden; }
+
+    /* ── Fix Streamlit expander arrow icon rendering as text ────── */
+    [data-testid="stExpander"] summary span[data-testid="stMarkdownContainer"] {
+        font-family: 'Inter', sans-serif !important;
+    }
+    details[data-testid="stExpander"] > summary::before,
+    details[data-testid="stExpander"] > summary::after {
+        font-family: 'Material Symbols Rounded' !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 
 # ===================================================================== #
-#  Helper Functions
+#  API Helpers
 # ===================================================================== #
 def api_get(endpoint: str, params: dict = None):
     """Safe GET request to the backend."""
@@ -246,65 +384,203 @@ def delta_class(value: float) -> str:
     return "delta-neutral"
 
 
+def load_tuning_results(ticker: str):
+    """Load the latest Optuna tuning results for a ticker from disk."""
+    path = os.path.join(TUNING_DIR, f"{ticker}_tuning.json")
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            return json.load(f)
+    return None
+
+
 # ===================================================================== #
 #  Sidebar
 # ===================================================================== #
 with st.sidebar:
-    st.markdown("### 🧠 Sentiprice")
-    st.markdown("---")
+    # ── Logo / Brand ─────────────────────────────────────────────
+    st.markdown("""
+    <div style="text-align: center; padding: 0.5rem 0 1rem 0;">
+        <div style="font-size: 2.2rem; margin-bottom: 0.2rem;">🧠</div>
+        <div style="color: #ffffff; font-size: 1.1rem; font-weight: 700; letter-spacing: -0.3px;">
+            Sentiprice
+        </div>
+        <div style="color: rgba(255,255,255,0.35); font-size: 0.7rem; font-weight: 400;">
+            AI Financial Correlator
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
-    # ── Backend Health ───────────────────────────────────────────
+    st.markdown('<hr class="custom-divider">', unsafe_allow_html=True)
+
+    # ── Backend Health ──────────────────────────────────────────
     health, health_err = api_get("/health")
+
+    st.markdown('<div class="sidebar-section-title">⚡ System Status</div>', unsafe_allow_html=True)
+
     if health:
-        dot_cls = "status-online" if health["status"] == "healthy" else "status-offline"
+        status = health["status"]
+        dot_cls = "status-online" if status == "healthy" else "status-offline"
         st.markdown(
             f'<span class="status-dot {dot_cls}"></span> '
-            f'**API:** {health["status"].capitalize()} &nbsp;·&nbsp; `{health["device"]}`',
+            f'**API** &nbsp;·&nbsp; {status.capitalize()} &nbsp;·&nbsp; `{health["device"]}`',
             unsafe_allow_html=True,
         )
-        st.caption(f"Uptime: {health['uptime_seconds']:.0f}s")
-        # Show available models
+        uptime = health.get("uptime_seconds", 0)
+        if uptime > 3600:
+            uptime_str = f"{uptime / 3600:.1f}h"
+        elif uptime > 60:
+            uptime_str = f"{uptime / 60:.0f}m"
+        else:
+            uptime_str = f"{uptime:.0f}s"
+        st.caption(f"Uptime: {uptime_str}")
+
         avail = health.get("available_models", [])
         if avail:
-            st.caption(f"Trained models: {', '.join(avail)}")
+            st.caption(f"🏷️ Trained models: **{', '.join(avail)}**")
     else:
         st.markdown(
-            '<span class="status-dot status-offline"></span> **API:** Offline',
+            '<span class="status-dot status-offline"></span> **API** &nbsp;·&nbsp; Offline',
             unsafe_allow_html=True,
         )
-        st.caption("Start the API with: `python main.py`")
+        st.caption("Start with: `python main.py`")
 
-    st.markdown("---")
+    st.markdown('<hr class="custom-divider">', unsafe_allow_html=True)
 
     # ── Controls ─────────────────────────────────────────────────
-    ticker = st.text_input("📈 Ticker Symbol", value="AAPL", key="ticker_input").upper()
-    days = st.slider("📅 History (days)", min_value=2, max_value=60, value=14, key="days_slider")
-    analyze_btn = st.button("⚡ Analyze", use_container_width=True, type="primary")
+    st.markdown('<div class="sidebar-section-title">🎛️ Controls</div>', unsafe_allow_html=True)
 
-    st.markdown("---")
+    ticker = st.text_input(
+        "Ticker Symbol",
+        value="AAPL",
+        key="ticker_input",
+        placeholder="e.g. AAPL, TSLA, MSFT",
+    ).upper()
 
-    # ── Model Info (ticker-specific) ─────────────────────────────
-    with st.expander("🔧 Model Info"):
+    days = st.slider(
+        "History (days)",
+        min_value=2,
+        max_value=60,
+        value=14,
+        key="days_slider",
+    )
+
+    analyze_btn = st.button(
+        "⚡ Analyze & Predict",
+        use_container_width=True,
+        type="primary",
+    )
+
+    st.markdown('<hr class="custom-divider">', unsafe_allow_html=True)
+
+    # ── Model Info ───────────────────────────────────────────────
+    st.markdown('<div class="sidebar-section-title">🔧 Model Architecture</div>', unsafe_allow_html=True)
+
+    show_model = st.checkbox("Show Model Details", value=False, key="model_toggle")
+    if show_model:
         model_info, info_err = api_get("/model/info", params={"ticker": ticker})
         if model_info:
-            st.code(f"Architecture: {model_info['architecture']}")
-            st.code(f"Parameters: {model_info['total_parameters']:,}")
-            st.code(f"Features: {len(model_info['feature_names'])}")
-            if model_info.get("training_config"):
-                cfg = model_info["training_config"]
-                st.caption(
-                    f"Trained on: {cfg.get('ticker', 'N/A')} · "
-                    f"LR: {cfg.get('lr', 'N/A')} · "
-                    f"Epochs: {cfg.get('epochs', 'N/A')}"
-                )
+            cfg = model_info.get("training_config", {})
+            st.markdown(f"""
+            <div class="sidebar-section">
+                <div class="tuning-stat">
+                    <span class="tuning-stat-label">Architecture</span>
+                    <span class="tuning-stat-value">{model_info['architecture']}</span>
+                </div>
+                <div class="tuning-stat">
+                    <span class="tuning-stat-label">Parameters</span>
+                    <span class="tuning-stat-value">{model_info['total_parameters']:,}</span>
+                </div>
+                <div class="tuning-stat">
+                    <span class="tuning-stat-label">Features</span>
+                    <span class="tuning-stat-value">{len(model_info.get('feature_names', []))}</span>
+                </div>
+                <div class="tuning-stat">
+                    <span class="tuning-stat-label">Hidden Dim</span>
+                    <span class="tuning-stat-value">{cfg.get('hidden_dim', 'N/A')}</span>
+                </div>
+                <div class="tuning-stat">
+                    <span class="tuning-stat-label">Layers</span>
+                    <span class="tuning-stat-value">{cfg.get('num_layers', 'N/A')}</span>
+                </div>
+                <div class="tuning-stat">
+                    <span class="tuning-stat-label">Learning Rate</span>
+                    <span class="tuning-stat-value">{cfg.get('lr', 'N/A')}</span>
+                </div>
+                <div class="tuning-stat">
+                    <span class="tuning-stat-label">Seq Length</span>
+                    <span class="tuning-stat-value">{cfg.get('seq_length', 'N/A')}</span>
+                </div>
+                <div class="tuning-stat">
+                    <span class="tuning-stat-label">Dropout</span>
+                    <span class="tuning-stat-value">{cfg.get('dropout', 'N/A')}</span>
+                </div>
+                <div class="tuning-stat">
+                    <span class="tuning-stat-label">Trained Ticker</span>
+                    <span class="tuning-stat-value">{cfg.get('ticker', 'N/A')}</span>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
         elif info_err and "404" in str(info_err):
-            st.warning(f"No trained model for {ticker}")
-            st.caption(f"Train with: `python train.py --ticker {ticker}`")
+            st.warning(f"No model for {ticker}")
+            st.caption(f"Train: `python train.py --ticker {ticker}`")
         else:
-            st.caption("Model info unavailable")
+            st.caption("Model info unavailable (API offline?)")
 
-    st.markdown("---")
-    st.caption("v1.0.0 · Built with Streamlit + FastAPI")
+    # ── Tuning Results ──────────────────────────────────────────
+    tuning = load_tuning_results(ticker)
+    if tuning:
+        st.markdown('<div class="sidebar-section-title">🔬 Optuna Tuning Results</div>', unsafe_allow_html=True)
+        show_tuning = st.checkbox("Show Tuning Details", value=False, key="tuning_toggle")
+        if show_tuning:
+            bp = tuning.get("best_params", {})
+            beats_icon = "✅" if tuning.get("beats_naive") else "❌"
+            r2 = tuning.get("best_r2", "N/A")
+            dollar_mae = tuning.get("best_dollar_mae", "N/A")
+            dir_acc = tuning.get("best_directional_accuracy", "N/A")
+
+            st.markdown(f"""
+            <div class="sidebar-section">
+                <div class="tuning-stat">
+                    <span class="tuning-stat-label">Trials</span>
+                    <span class="tuning-stat-value">{tuning.get('n_trials', 'N/A')}</span>
+                </div>
+                <div class="tuning-stat">
+                    <span class="tuning-stat-label">Best Test MSE</span>
+                    <span class="tuning-stat-value">{tuning.get('best_test_mse', 0):.5f}</span>
+                </div>
+                <div class="tuning-stat">
+                    <span class="tuning-stat-label">Dollar MAE</span>
+                    <span class="tuning-stat-value">${dollar_mae}</span>
+                </div>
+                <div class="tuning-stat">
+                    <span class="tuning-stat-label">Dir. Accuracy</span>
+                    <span class="tuning-stat-value">{dir_acc}%</span>
+                </div>
+                <div class="tuning-stat">
+                    <span class="tuning-stat-label">R² Score</span>
+                    <span class="tuning-stat-value">{r2}</span>
+                </div>
+                <div class="tuning-stat">
+                    <span class="tuning-stat-label">Beats Naive?</span>
+                    <span class="tuning-stat-value">{beats_icon}</span>
+                </div>
+                <div class="tuning-stat">
+                    <span class="tuning-stat-label">Duration</span>
+                    <span class="tuning-stat-value">{tuning.get('elapsed_seconds', 0):.0f}s</span>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            st.caption("Best Hyperparameters:")
+            st.code(json.dumps(bp, indent=2), language="json")
+
+    st.markdown('<hr class="custom-divider">', unsafe_allow_html=True)
+
+    st.markdown("""
+    <div style="text-align: center; color: rgba(255,255,255,0.2); font-size: 0.68rem; padding: 0.5rem 0;">
+        v1.0.0 · Streamlit + FastAPI + PyTorch
+    </div>
+    """, unsafe_allow_html=True)
 
 
 # ===================================================================== #
@@ -313,7 +589,7 @@ with st.sidebar:
 st.markdown("""
 <div class="header-bar">
     <h1>🤖 Multi-Modal Sentiment & Price Correlator</h1>
-    <p>BERT-powered news sentiment analysis fused with LSTM time-series prediction</p>
+    <p>BERT-powered news sentiment analysis fused with LSTM time-series prediction · Optuna-optimized</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -322,8 +598,8 @@ st.markdown("""
 #  Main Content
 # ===================================================================== #
 if analyze_btn:
-    # ── Prediction ───────────────────────────────────────────────
-    with st.spinner(f"Analyzing {ticker}..."):
+    # ── Prediction ──────────────────────────────────────────────
+    with st.spinner(f"🔮 Analyzing {ticker}..."):
         pred_data, pred_err = api_post("/predict", {"ticker": ticker, "days": days})
 
     if pred_err:
@@ -365,10 +641,11 @@ if analyze_btn:
             pct = pred_data["price_change_pct"]
             pct_cls = delta_class(pct)
             pct_arrow = "▲" if pct > 0 else "▼" if pct < 0 else "●"
+            pct_color = "color-green" if pct > 0 else "color-red" if pct < 0 else "color-amber"
             st.markdown(f"""
             <div class="metric-card">
                 <div class="metric-label">Price Change</div>
-                <div class="metric-value {pct_cls}">{pct_arrow} {abs(pct):.4f}%</div>
+                <div class="metric-value {pct_color}">{pct_arrow} {abs(pct):.4f}%</div>
                 <div class="metric-delta delta-neutral">Next Hour</div>
             </div>
             """, unsafe_allow_html=True)
@@ -453,10 +730,7 @@ if analyze_btn:
             ),
             hovermode="x unified",
         )
-        fig.update_xaxes(
-            gridcolor="rgba(255,255,255,0.04)",
-            showgrid=True,
-        )
+        fig.update_xaxes(gridcolor="rgba(255,255,255,0.04)", showgrid=True)
         fig.update_yaxes(
             title_text="Price ($)",
             gridcolor="rgba(255,255,255,0.04)",
@@ -480,7 +754,7 @@ if analyze_btn:
             "#34d399" if c >= p else "#f87171"
             for c, p in zip(df["close"].iloc[1:], df["close"].iloc[:-1])
         ]
-        vol_colors.insert(0, "#60a5fa")  # first bar default
+        vol_colors.insert(0, "#60a5fa")
 
         fig_vol = go.Figure()
         fig_vol.add_trace(
@@ -518,6 +792,7 @@ if analyze_btn:
         sc4.metric("Sentiment Std", f"{df['sentiment'].std():.4f}")
 
         # ── Raw Data Expander ────────────────────────────────────
+        # ── Raw Data Table ──────────────────────────────────────
         with st.expander("📄 Raw Data Table"):
             display_df = df.copy()
             display_df["timestamp"] = display_df["timestamp"].dt.strftime("%Y-%m-%d %H:%M")
@@ -541,42 +816,88 @@ if analyze_btn:
 else:
     # ── Welcome State ────────────────────────────────────────────
     st.markdown("""
-    <div class="glass-card" style="text-align: center; padding: 4rem 2rem;">
-        <div style="font-size: 4rem; margin-bottom: 1rem;">🧠</div>
-        <h2 style="color: #ffffff; font-weight: 600; margin-bottom: 0.5rem;">
+    <div class="glass-card" style="text-align: center; padding: 3.5rem 2rem;">
+        <div style="font-size: 3.5rem; margin-bottom: 0.8rem;">🧠</div>
+        <h2 style="color: #ffffff; font-weight: 700; margin-bottom: 0.5rem; font-size: 1.6rem;">
             Ready to Analyze
         </h2>
-        <p style="color: rgba(255,255,255,0.5); font-size: 1.05rem; max-width: 500px; margin: 0 auto;">
-            Enter a ticker symbol in the sidebar and click <strong>⚡ Analyze</strong> 
-            to get real-time price predictions powered by BERT sentiment analysis 
+        <p style="color: rgba(255,255,255,0.45); font-size: 0.95rem; max-width: 520px; margin: 0 auto; line-height: 1.6;">
+            Enter a ticker symbol in the sidebar and click <strong style="color: rgba(255,255,255,0.7);">⚡ Analyze & Predict</strong>
+            to get next-hour price predictions powered by BERT sentiment analysis
             and LSTM time-series forecasting.
         </p>
-        <br>
-        <div style="display: flex; justify-content: center; gap: 2rem; flex-wrap: wrap;">
-            <div style="text-align: center;">
-                <div style="font-size: 1.5rem;">📰</div>
-                <div style="color: rgba(255,255,255,0.4); font-size: 0.8rem; margin-top: 0.3rem;">
-                    BERT Sentiment
-                </div>
+        <div class="features-grid">
+            <div class="feature-item">
+                <div class="feature-icon">📰</div>
+                <div class="feature-label">BERT Sentiment</div>
             </div>
-            <div style="text-align: center;">
-                <div style="font-size: 1.5rem;">📈</div>
-                <div style="color: rgba(255,255,255,0.4); font-size: 0.8rem; margin-top: 0.3rem;">
-                    LSTM Forecasting
-                </div>
+            <div class="feature-item">
+                <div class="feature-icon">📈</div>
+                <div class="feature-label">LSTM Forecasting</div>
             </div>
-            <div style="text-align: center;">
-                <div style="font-size: 1.5rem;">⚡</div>
-                <div style="color: rgba(255,255,255,0.4); font-size: 0.8rem; margin-top: 0.3rem;">
-                    Real-Time API
-                </div>
+            <div class="feature-item">
+                <div class="feature-icon">🔬</div>
+                <div class="feature-label">Optuna Tuned</div>
             </div>
-            <div style="text-align: center;">
-                <div style="font-size: 1.5rem;">🔀</div>
-                <div style="color: rgba(255,255,255,0.4); font-size: 0.8rem; margin-top: 0.3rem;">
-                    Multi-Modal Fusion
-                </div>
+            <div class="feature-item">
+                <div class="feature-icon">⚡</div>
+                <div class="feature-label">Real-Time API</div>
+            </div>
+            <div class="feature-item">
+                <div class="feature-icon">🔀</div>
+                <div class="feature-label">Multi-Modal Fusion</div>
             </div>
         </div>
     </div>
     """, unsafe_allow_html=True)
+
+    # ── Quick-start cards ─────────────────────────────────────
+    st.markdown("<br>", unsafe_allow_html=True)
+    q1, q2, q3 = st.columns(3)
+
+    with q1:
+        st.markdown("""
+        <div class="glass-card" style="min-height: 160px;">
+            <div style="font-size: 1.3rem; margin-bottom: 0.5rem;">🏋️ Train</div>
+            <p style="color: rgba(255,255,255,0.4); font-size: 0.82rem; line-height: 1.5; margin: 0;">
+                Train a model for any ticker symbol using price data and news sentiment.
+            </p>
+            <code style="font-size: 0.72rem; color: #a78bfa; margin-top: 0.5rem; display: block;">
+                python train.py --ticker AAPL
+            </code>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with q2:
+        st.markdown("""
+        <div class="glass-card" style="min-height: 160px;">
+            <div style="font-size: 1.3rem; margin-bottom: 0.5rem;">🔬 Tune</div>
+            <p style="color: rgba(255,255,255,0.4); font-size: 0.82rem; line-height: 1.5; margin: 0;">
+                Optimize hyperparameters with Optuna to find the best model configuration.
+            </p>
+            <code style="font-size: 0.72rem; color: #a78bfa; margin-top: 0.5rem; display: block;">
+                python evaluate.py --ticker AAPL --trials 20
+            </code>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with q3:
+        st.markdown("""
+        <div class="glass-card" style="min-height: 160px;">
+            <div style="font-size: 1.3rem; margin-bottom: 0.5rem;">🚀 Serve</div>
+            <p style="color: rgba(255,255,255,0.4); font-size: 0.82rem; line-height: 1.5; margin: 0;">
+                Launch the FastAPI backend and make live predictions via this dashboard.
+            </p>
+            <code style="font-size: 0.72rem; color: #a78bfa; margin-top: 0.5rem; display: block;">
+                python main.py
+            </code>
+        </div>
+        """, unsafe_allow_html=True)
+
+
+# ── App Footer ──────────────────────────────────────────────────
+st.markdown("""
+<div class="app-footer">
+    Sentiprice Correlator · Built with PyTorch, FastAPI, Streamlit, Optuna · 2026
+</div>
+""", unsafe_allow_html=True)

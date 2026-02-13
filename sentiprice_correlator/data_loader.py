@@ -290,14 +290,41 @@ class MarketDataLoader:
         price_df = self.fetch_price_data(start, end, interval="1h")
         sentiment_df = self.fetch_news_sentiment(start, end)
 
-        # Timezone Safety
+        # Timezone Normalization (Force UTC)
         if price_df.index.tz is None:
             price_df.index = price_df.index.tz_localize("UTC")
+        else:
+            price_df.index = price_df.index.tz_convert("UTC")
+            
         if sentiment_df.index.tz is None:
             sentiment_df.index = sentiment_df.index.tz_localize("UTC")
+        else:
+            sentiment_df.index = sentiment_df.index.tz_convert("UTC")
 
-        # Left-join: keep ALL price rows, fill missing sentiment with 0.0
-        combined = price_df.join(sentiment_df, how="left")
+        # DEBUG: Print exact index values for diagnosis
+        if not price_df.empty and not sentiment_df.empty:
+            print("\n  🔍 DEBUG: Merge Pre-Check")
+            print(f"  Price Head (UTC): {price_df.index[:5]}")
+            print(f"  Sent Head (UTC):  {sentiment_df.index[:5]}")
+            print(f"  Price Tail (UTC): {price_df.index[-5:]}")
+            print(f"  Sent Tail (UTC):  {sentiment_df.index[-5:]}")
+        
+        # Merge with loose alignment (nearest sentiment to price point)
+        # using 'nearest' helps bridge overnight gaps (e.g. attach 8am news to prev 4pm close)
+        # ensuring we capture the latest sentiment signal even if market was closed.
+        price_df = price_df.sort_index()
+        sentiment_df = sentiment_df.sort_index()
+        
+        combined = pd.merge_asof(
+            price_df,
+            sentiment_df,
+            left_index=True,
+            right_index=True,
+            direction="nearest", 
+            tolerance=pd.Timedelta("48h")
+        )
+
+        # Forward fill any gaps if merge_asof missed (unlikely with backward)
         combined["Sentiment"] = combined["Sentiment"].ffill().fillna(0.0)
         combined = combined.dropna(subset=["Close", "Volume"])
 

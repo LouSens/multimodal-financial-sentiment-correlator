@@ -268,12 +268,16 @@ class DataPreprocessor:
         logger.info("━━━ Preprocessing complete ━━━\n")
         return splits, self.feature_names
 
-    def create_sequences(self, df: pd.DataFrame, seq_length: int = 24):
+    def create_sequences(self, df: pd.DataFrame, seq_length: int = None):
         """
-        Legacy-compatible method (used by main.py / train.py).
+        Legacy-compatible method (used by train.py for initial data prep).
         Returns (X, y) tensors with cleaning + feature engineering applied.
+
+        If the scaler is already fitted (e.g. loaded from joblib),
+        it will use transform-only (no re-fit) to preserve the training scaler.
         """
-        self.seq_length = seq_length
+        if seq_length is not None:
+            self.seq_length = seq_length
 
         df = self._clean(df)
         df = self._engineer_features(df)
@@ -282,7 +286,8 @@ class DataPreprocessor:
         self._n_features = len(self.feature_names)
 
         values = df.values.astype(np.float32)
-        scaled = self._scale(values, fit=True)
+        # Auto-detect: if scaler is already fitted (loaded from file), don't re-fit
+        scaled = self._scale(values, fit=not self._is_fitted)
         X, y = self._create_sequences(scaled)
 
         return torch.FloatTensor(X), torch.FloatTensor(y)
