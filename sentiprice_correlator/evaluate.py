@@ -312,8 +312,9 @@ def run_tuning(ticker: str, n_trials: int = 20, trial_epochs: int = 50,
 
     Returns
     -------
-    best_params : dict    Best hyperparameters found
+    best_params : dict        Best hyperparameters found
     study       : optuna.Study
+    df          : DataFrame   Cached market data (reuse for retrain/eval)
     """
     device = get_device()
     set_seed(seed)
@@ -331,7 +332,7 @@ def run_tuning(ticker: str, n_trials: int = 20, trial_epochs: int = 50,
 
     if len(df) < 50:
         logger.error(f"  ❌ Not enough data ({len(df)} rows). Need at least 50.")
-        return None, None
+        return None, None, None
 
     # Create Optuna study
     study = optuna.create_study(
@@ -408,14 +409,14 @@ def run_tuning(ticker: str, n_trials: int = 20, trial_epochs: int = 50,
         json.dump(results, f, indent=2)
     logger.info(f"  💾 Results saved → {results_path}")
 
-    return best.params, study
+    return best.params, study, df
 
 
 # ===================================================================== #
 #  Retrain with Best Params
 # ===================================================================== #
 def retrain_best(ticker: str, best_params: dict, days: int = 700,
-                 epochs: int = 200, patience: int = 25):
+                 epochs: int = 200, patience: int = 25, data=None):
     """Retrain the model with discovered best params and save checkpoint."""
     from train import train_model
 
@@ -437,6 +438,7 @@ def retrain_best(ticker: str, best_params: dict, days: int = 700,
         dropout=best_params.get("dropout", 0.3),
         grad_clip=best_params.get("grad_clip", 1.0),
         patience=patience,
+        data=data,
     )
 
     return model, processor, history
@@ -445,7 +447,7 @@ def retrain_best(ticker: str, best_params: dict, days: int = 700,
 # ===================================================================== #
 #  Evaluate Existing Model
 # ===================================================================== #
-def evaluate_existing(ticker: str, days: int = 700):
+def evaluate_existing(ticker: str, days: int = 700, data=None):
     """Load an existing trained model and run full evaluation."""
     device = get_device()
 
@@ -481,11 +483,15 @@ def evaluate_existing(ticker: str, days: int = 700):
     else:
         logger.warning("  ⚠️  No scaler found — using fresh preprocessing")
 
-    # Load fresh data
-    logger.info("  📥 Loading market data...")
-    loader = MarketDataLoader(ticker)
-    df = loader.get_aligned_data(days=days)
-    logger.info(f"  📊 Data: {df.shape[0]} rows")
+    # Load fresh data (or reuse cached)
+    if data is not None:
+        df = data
+        logger.info(f"  � Using cached data: {df.shape[0]} rows")
+    else:
+        logger.info("  �📥 Loading market data...")
+        loader = MarketDataLoader(ticker)
+        df = loader.get_aligned_data(days=days)
+        logger.info(f"  📊 Data: {df.shape[0]} rows")
 
     seq_length = config.get("seq_length", 24)
     metrics = compute_real_metrics(model, processor, df, device, seq_length)
@@ -547,8 +553,8 @@ if __name__ == "__main__":
         # Just evaluate existing model
         evaluate_existing(args.ticker, days=args.days)
     else:
-        # Run hyperparameter tuning
-        best_params, study = run_tuning(
+        # Run hyperparameter tuning (loads data ONCE)
+        best_params, study, cached_df = run_tuning(
             ticker=args.ticker,
             n_trials=args.trials,
             trial_epochs=args.trial_epochs,
@@ -558,15 +564,16 @@ if __name__ == "__main__":
         )
 
         if best_params and not args.no_retrain:
-            # Retrain with best params (full epochs)
+            # Retrain with best params (reuse cached data)
             model, processor, history = retrain_best(
                 ticker=args.ticker,
                 best_params=best_params,
                 days=args.days,
                 epochs=args.final_epochs,
                 patience=args.final_patience,
+                data=cached_df,
             )
 
-            # Final evaluation
+            # Final evaluation (reuse cached data)
             logger.info("")
-            evaluate_existing(args.ticker, days=args.days)
+            evaluate_existing(args.ticker, days=args.days, data=cached_df)

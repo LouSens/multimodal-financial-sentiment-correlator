@@ -68,6 +68,7 @@ class MarketDataLoader:
     def _fetch_yfinance_news(self):
         """
         Fetches recent news headlines directly from Yahoo Finance.
+        Handles multiple yfinance API versions (field names change across versions).
         Returns a DataFrame with columns: headline, date.
         """
         print(f"  📡 Fetching live news from Yahoo Finance...")
@@ -81,14 +82,58 @@ class MarketDataLoader:
 
             records = []
             for item in news_items:
-                title = item.get("title") or item.get("headline", "")
-                pub_time = item.get("providerPublishTime")
+                # --- Extract title (multiple possible field names) ---
+                title = (
+                    item.get("title")
+                    or item.get("headline")
+                    or (item.get("content", {}) or {}).get("title")
+                    or ""
+                )
 
-                if not title or not pub_time:
+                # --- Extract timestamp (multiple possible formats) ---
+                dt = None
+
+                # Format 1: Unix timestamp (older yfinance)
+                pub_time = item.get("providerPublishTime")
+                if pub_time and isinstance(pub_time, (int, float)):
+                    dt = pd.to_datetime(pub_time, unit="s", utc=True)
+
+                # Format 2: ISO string in 'publish_time' or 'pubDate'
+                if dt is None:
+                    for key in ["publish_time", "pubDate"]:
+                        val = item.get(key)
+                        if val:
+                            try:
+                                dt = pd.to_datetime(val, utc=True)
+                            except Exception:
+                                pass
+                            if dt is not None:
+                                break
+
+                # Format 3: Nested in 'content' dict (newest yfinance)
+                if dt is None:
+                    content = item.get("content", {}) or {}
+                    for key in ["pubDate", "publish_time", "providerPublishTime"]:
+                        val = content.get(key)
+                        if val:
+                            try:
+                                if isinstance(val, (int, float)):
+                                    dt = pd.to_datetime(val, unit="s", utc=True)
+                                else:
+                                    dt = pd.to_datetime(val, utc=True)
+                            except Exception:
+                                pass
+                            if dt is not None:
+                                break
+
+                # Format 4: Use current time as fallback if title exists
+                if dt is None and title:
+                    dt = pd.Timestamp.now(tz="UTC")
+
+                if not title or dt is None:
                     continue
 
-                dt = pd.to_datetime(pub_time, unit="s", utc=True)
-                records.append({"headline": title, "date": dt})
+                records.append({"headline": title.strip(), "date": dt})
 
             if not records:
                 print("  ⚠ No parseable headlines.")

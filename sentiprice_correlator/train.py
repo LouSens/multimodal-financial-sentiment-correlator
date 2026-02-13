@@ -183,6 +183,7 @@ def train_model(
     grad_clip: float = 1.0,
     patience: int = 15,
     seed: int = 42,
+    data=None,
 ):
     """
     End-to-end training pipeline.
@@ -220,10 +221,14 @@ def train_model(
     }
 
     # ── 1. Load Data ─────────────────────────────────────────────────────
-    logger.info("  📥 Loading market data...")
-    loader = MarketDataLoader(ticker)
-    df = loader.get_aligned_data(days=days)
-    logger.info(f"  📊 Raw data: {df.shape[0]} rows × {df.shape[1]} cols")
+    if data is not None:
+        df = data
+        logger.info(f"  📊 Using pre-loaded data: {df.shape[0]} rows × {df.shape[1]} cols")
+    else:
+        logger.info("  📥 Loading market data...")
+        loader = MarketDataLoader(ticker)
+        df = loader.get_aligned_data(days=days)
+        logger.info(f"  📊 Raw data: {df.shape[0]} rows × {df.shape[1]} cols")
 
     # ── 2. Preprocess → DataLoaders ──────────────────────────────────────
     processor = DataPreprocessor(seq_length=seq_length)
