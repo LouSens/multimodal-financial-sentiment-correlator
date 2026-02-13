@@ -11,3 +11,5 @@ vaderSentiment
 plotly
 tqdm
 joblib
+optuna
+requests
