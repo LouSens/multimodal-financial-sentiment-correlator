@@ -10,6 +10,7 @@ Features
   • Gradient clipping           (max_norm = 1.0)
   • Early stopping              (patience-based on val loss)
   • Best-model checkpointing    (saves weights + scaler + config)
+  • Ticker-specific folders     (checkpoints/AAPL/, checkpoints/TSLA/, etc.)
   • Rich logging & tqdm bars
   • CLI via argparse
 """
@@ -43,7 +44,15 @@ logger = logging.getLogger(__name__)
 # ───────────────────────────────────────────────────────────────────── #
 #  Paths
 # ───────────────────────────────────────────────────────────────────── #
-CHECKPOINT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CHECKPOINT_DIR = os.path.join(BASE_DIR, "checkpoints")
+
+
+def get_ticker_dir(ticker: str) -> str:
+    """Return the ticker-specific checkpoint folder, e.g. checkpoints/AAPL/"""
+    d = os.path.join(CHECKPOINT_DIR, ticker.upper())
+    os.makedirs(d, exist_ok=True)
+    return d
 
 
 # ===================================================================== #
@@ -152,7 +161,7 @@ def save_checkpoint(model, processor, config, path):
         "config": config,
     }
     torch.save(checkpoint, path)
-    # Also save the scaler alongside
+    # Also save the scaler alongside (uses processor._scaler_path)
     processor.save_scaler()
     logger.info(f"  💾 Checkpoint saved → {path}")
 
@@ -178,6 +187,11 @@ def train_model(
     """
     End-to-end training pipeline.
 
+    Saves all artifacts to checkpoints/{TICKER}/:
+      • best_model.pth   — model weights + config
+      • scaler.joblib     — fitted preprocessor scaler
+      • model_weights.pth — legacy flat weights
+
     Returns
     -------
     model : MultiModalNet         (best checkpoint, loaded)
@@ -187,6 +201,11 @@ def train_model(
     # ── Setup ────────────────────────────────────────────────────────────
     set_seed(seed)
     device = get_device()
+
+    # Ticker-specific output folder
+    ticker_dir = get_ticker_dir(ticker)
+    logger.info(f"  📁 Output folder → {ticker_dir}")
+
     logger.info("━" * 60)
     logger.info(f"  🏋️  TRAINING  |  ticker={ticker}  epochs={epochs}  "
                 f"batch={batch_size}  lr={lr}")
@@ -208,6 +227,9 @@ def train_model(
 
     # ── 2. Preprocess → DataLoaders ──────────────────────────────────────
     processor = DataPreprocessor(seq_length=seq_length)
+    # Point scaler persistence to ticker-specific folder
+    processor._scaler_path = os.path.join(ticker_dir, "scaler.joblib")
+
     train_loader, val_loader, test_loader, feature_names = processor.get_dataloaders(
         df, batch_size=batch_size, seq_length=seq_length
     )
@@ -229,7 +251,7 @@ def train_model(
 
     # ── 4. Training Loop ─────────────────────────────────────────────────
     best_val_mse = float("inf")
-    best_path = os.path.join(CHECKPOINT_DIR, "best_model.pth")
+    best_path = os.path.join(ticker_dir, "best_model.pth")
     history = {"train_loss": [], "val_mse": [], "val_mae": [], "lr": []}
 
     logger.info("")
@@ -238,14 +260,23 @@ def train_model(
 
     t_start = time.time()
 
+    # Detect if val/test are empty
+    has_val = len(val_loader.dataset) > 0
+    has_test = len(test_loader.dataset) > 0
+    if not has_val:
+        logger.info("  ⚠️  No validation set — using train loss for checkpointing")
+
     for epoch in range(1, epochs + 1):
         # — Train —
         train_loss = train_one_epoch(
             model, train_loader, criterion, optimizer, device, grad_clip
         )
 
-        # — Validate —
-        val_mse, val_mae = evaluate(model, val_loader, criterion, device)
+        # — Validate (or use train loss as proxy) —
+        if has_val:
+            val_mse, val_mae = evaluate(model, val_loader, criterion, device)
+        else:
+            val_mse, val_mae = train_loss, train_loss  # proxy
 
         # — Scheduler step (epoch-based for warm restarts) —
         scheduler.step(epoch - 1)
@@ -259,21 +290,20 @@ def train_model(
 
         # — Best model checkpoint —
         status = ""
-        # Skip checkpoint/early-stop if val is NaN (empty val set)
-        if not (val_mse != val_mse):  # NaN check
-            if val_mse < best_val_mse:
-                best_val_mse = val_mse
-                save_checkpoint(model, processor, config, best_path)
-                status = "✅ saved"
+        if val_mse < best_val_mse:
+            best_val_mse = val_mse
+            save_checkpoint(model, processor, config, best_path)
+            status = "✅ saved"
 
         # — Logging —
+        val_label = "Train*" if not has_val else "Val"
         logger.info(
             f"  {epoch:>5d} │ {train_loss:>10.6f} │ {val_mse:>9.6f} │ "
             f"{val_mae:>9.6f} │ {current_lr:>9.6f} │ {status}"
         )
 
-        # — Early stopping (skip if val is NaN) —
-        if not (val_mse != val_mse) and early_stop.step(val_mse):
+        # — Early stopping —
+        if early_stop.step(val_mse):
             logger.info(f"\n  ⏹️  Early stopping triggered at epoch {epoch} "
                         f"(patience={patience})")
             break
@@ -283,23 +313,33 @@ def train_model(
                 f"({epoch} epochs)")
 
     # ── 5. Load Best Model & Test ────────────────────────────────────────
-    logger.info("\n  📈 Loading best checkpoint for final evaluation...")
-    checkpoint = torch.load(best_path, map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    if os.path.exists(best_path):
+        logger.info("\n  📈 Loading best checkpoint for final evaluation...")
+        checkpoint = torch.load(best_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+    else:
+        logger.info("\n  ⚠️  No checkpoint found — using final epoch weights")
+        save_checkpoint(model, processor, config, best_path)
 
-    test_mse, test_mae = evaluate(model, test_loader, criterion, device)
-    logger.info("  ┌──────────────────────────────┐")
-    logger.info(f"  │  TEST MSE  : {test_mse:.6f}       │")
-    logger.info(f"  │  TEST MAE  : {test_mae:.6f}       │")
-    logger.info(f"  │  Best Val  : {best_val_mse:.6f}       │")
-    logger.info("  └──────────────────────────────┘")
+    if has_test:
+        test_mse, test_mae = evaluate(model, test_loader, criterion, device)
+        test_mse_str = f"{test_mse:.6f}"
+        test_mae_str = f"{test_mae:.6f}"
+    else:
+        test_mse_str = "N/A (no test set)"
+        test_mae_str = "N/A (no test set)"
 
-    # Also keep the legacy flat weights file for main.py compatibility
-    legacy_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "model_weights.pth"
-    )
+    logger.info("  ┌──────────────────────────────────────┐")
+    logger.info(f"  │  TEST MSE  : {test_mse_str:<22s} │")
+    logger.info(f"  │  TEST MAE  : {test_mae_str:<22s} │")
+    logger.info(f"  │  Best Val  : {best_val_mse:.6f}                │")
+    logger.info("  └──────────────────────────────────────┘")
+
+    # Also save flat weights in the ticker folder
+    legacy_path = os.path.join(ticker_dir, "model_weights.pth")
     torch.save(model.state_dict(), legacy_path)
     logger.info(f"  💾 Legacy weights → {legacy_path}")
+    logger.info(f"  📁 All files saved in: {ticker_dir}")
 
     return model, processor, history
 

@@ -22,7 +22,7 @@ import logging
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
 
-# Default path for persisting the fitted scaler
+# Default path for persisting the fitted scaler (legacy fallback)
 _SCALER_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "scaler.joblib"
 )
@@ -45,6 +45,7 @@ class DataPreprocessor:
         self.scaler = RobustScaler()
         self._n_features: int = 0   # set after feature engineering
         self._is_fitted: bool = False
+        self._scaler_path: str = _SCALER_PATH  # overridable per-ticker
 
     # ------------------------------------------------------------------ #
     #  1. CLEANING
@@ -192,6 +193,11 @@ class DataPreprocessor:
         IMPORTANT: The scaler is fitted ONLY on the training portion
         to prevent data leakage from val/test into the training stats.
 
+        Uses adaptive splitting:
+          • 3-way (70/15/15) if enough data
+          • 2-way (80/20)    if data is tight
+          • Train-only       if data is very small (with warning)
+
         Returns
         -------
         splits : dict   {"train": (X, y), "val": (X, y), "test": (X, y)}
@@ -210,20 +216,38 @@ class DataPreprocessor:
         self.feature_names = list(df.columns)
         self._n_features = len(self.feature_names)
 
-        # 3. Split the raw data FIRST (before scaling)
+        # 3. Adaptive split — guarantee viable sizes
         values = df.values.astype(np.float32)
         n = len(values)
-        train_end = int(n * 0.70)
-        val_end = int(n * 0.85)
+        min_split = self.seq_length + 2  # minimum rows needed per split
+
+        if n >= min_split * 4:
+            # Enough for 3-way split (70/15/15)
+            train_end = int(n * 0.70)
+            val_end = int(n * 0.85)
+            split_mode = "3-way (70/15/15)"
+        elif n >= min_split * 2:
+            # Enough for 2-way split (80/20), no separate test
+            train_end = int(n * 0.80)
+            val_end = n
+            split_mode = "2-way (80/20)"
+        else:
+            # Very small dataset — train only
+            train_end = n
+            val_end = n
+            split_mode = "train-only (⚠ no validation)"
+
+        logger.info(f"  📐 Split mode: {split_mode} ({n} total rows, "
+                    f"min per split: {min_split})")
 
         train_raw = values[:train_end]
-        val_raw = values[train_end:val_end]
-        test_raw = values[val_end:]
+        val_raw = values[train_end:val_end] if train_end < val_end else np.empty((0, self._n_features))
+        test_raw = values[val_end:] if val_end < n else np.empty((0, self._n_features))
 
         # 4. Fit scaler ONLY on training data (prevents leakage)
         train_scaled = self._scale(train_raw, fit=True)
-        val_scaled = self._scale(val_raw, fit=False)
-        test_scaled = self._scale(test_raw, fit=False)
+        val_scaled = self._scale(val_raw, fit=False) if len(val_raw) > 0 else val_raw
+        test_scaled = self._scale(test_raw, fit=False) if len(test_raw) > 0 else test_raw
 
         # 5. Create sequences per split
         splits = {}
@@ -231,12 +255,11 @@ class DataPreprocessor:
                                    ("val", val_scaled),
                                    ("test", test_scaled)]:
             if len(data_scaled) <= self.seq_length:
-                logger.warning(f"  ⚠️  {name} split too small for sequences "
-                               f"({len(data_scaled)} rows, need >{self.seq_length})")
                 splits[name] = (
                     torch.FloatTensor(np.empty((0, self.seq_length, self._n_features))),
                     torch.FloatTensor(np.empty((0,))),
                 )
+                logger.info(f"    {name:>5s}:  0 samples (split too small)")
                 continue
             X, y = self._create_sequences(data_scaled)
             splits[name] = (torch.FloatTensor(X), torch.FloatTensor(y))
@@ -303,10 +326,14 @@ class DataPreprocessor:
         return self.scaler.inverse_transform(dummy)[:, 0]
 
     # ------------------------------------------------------------------ #
-    #  SCALER PERSISTENCE
+    #  SCALER PERSISTENCE (ticker-aware)
     # ------------------------------------------------------------------ #
-    def save_scaler(self, path: str = _SCALER_PATH):
-        """Persist fitted scaler + metadata to disk."""
+    def save_scaler(self, path: str = None):
+        """Persist fitted scaler + metadata to disk.
+        Uses self._scaler_path if no explicit path given.
+        """
+        path = path or self._scaler_path
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         state = {
             "scaler": self.scaler,
             "n_features": self._n_features,
@@ -316,8 +343,11 @@ class DataPreprocessor:
         joblib.dump(state, path)
         logger.info(f"  💾 Scaler saved → {path}")
 
-    def load_scaler(self, path: str = _SCALER_PATH):
-        """Restore a previously saved scaler from disk."""
+    def load_scaler(self, path: str = None):
+        """Restore a previously saved scaler from disk.
+        Uses self._scaler_path if no explicit path given.
+        """
+        path = path or self._scaler_path
         if not os.path.exists(path):
             raise FileNotFoundError(f"Scaler file not found: {path}")
         state = joblib.load(path)

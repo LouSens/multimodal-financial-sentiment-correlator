@@ -7,6 +7,12 @@ Endpoints
   GET   /health           → liveness check + model status
   GET   /model/info       → architecture config & parameter count
   GET   /history/{ticker} → historical price + sentiment time-series
+  GET   /models           → list all trained ticker models
+
+Dynamic model loading:
+  When /predict is called with a specific ticker, the API dynamically
+  loads that ticker's model from checkpoints/{TICKER}/. Models are
+  cached in memory after first load for fast subsequent requests.
 
 Run
 ───
@@ -82,6 +88,11 @@ def find_available_models():
 # ───────────────────────────────────────────────────────────────────── #
 _fetch_lock = asyncio.Lock()
 
+# ───────────────────────────────────────────────────────────────────── #
+#  Model cache — keeps loaded models in memory per ticker
+# ───────────────────────────────────────────────────────────────────── #
+_model_cache: dict = {}  # {ticker: {"model": ..., "processor": ..., "config": ...}}
+
 
 # ===================================================================== #
 #  Device Detection
@@ -94,73 +105,114 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
+def load_ticker_model(ticker: str, device: torch.device):
+    """
+    Load a ticker-specific model + scaler from checkpoints/{TICKER}/.
+    Returns (model, processor, config) or raises HTTPException.
+    """
+    ticker = ticker.upper()
+
+    # Return from cache if already loaded
+    if ticker in _model_cache:
+        entry = _model_cache[ticker]
+        return entry["model"], entry["processor"], entry["config"]
+
+    paths = get_ticker_paths(ticker)
+
+    # Check if ticker model exists
+    if not os.path.exists(paths["checkpoint"]):
+        # Try legacy paths as fallback
+        if os.path.exists(LEGACY_CHECKPOINT):
+            ckpt_path = LEGACY_CHECKPOINT
+            scaler_path = LEGACY_SCALER
+            logger.info(f"  � No {ticker} model found, using legacy checkpoint")
+        elif os.path.exists(LEGACY_WEIGHTS):
+            # Legacy flat weights (no config)
+            model = MultiModalNet()
+            model.load_state_dict(torch.load(LEGACY_WEIGHTS, map_location=device))
+            model.to(device).eval()
+            processor = DataPreprocessor()
+            if os.path.exists(LEGACY_SCALER):
+                processor.load_scaler(LEGACY_SCALER)
+            _model_cache[ticker] = {"model": model, "processor": processor, "config": {}}
+            return model, processor, {}
+        else:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No trained model found for '{ticker}'. "
+                       f"Run: python train.py --ticker {ticker}"
+            )
+    else:
+        ckpt_path = paths["checkpoint"]
+        scaler_path = paths["scaler"]
+
+    # Load model
+    model = MultiModalNet()
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.to(device).eval()
+    config = checkpoint.get("config", {})
+
+    # Load scaler
+    processor = DataPreprocessor()
+    if os.path.exists(scaler_path):
+        processor.load_scaler(scaler_path)
+    else:
+        logger.warning(f"  ⚠️  No scaler found for {ticker} — predictions may be inaccurate.")
+
+    # Cache for future requests
+    _model_cache[ticker] = {"model": model, "processor": processor, "config": config}
+    logger.info(f"  ✅ Loaded and cached {ticker} model from {ckpt_path}")
+
+    return model, processor, config
+
+
 # ===================================================================== #
-#  Lifespan — load model once at startup
+#  Lifespan — preload available models at startup
 # ===================================================================== #
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    """Load model & scaler into app.state on startup; cleanup on shutdown."""
+    """Discover models and preload default at startup; cleanup on shutdown."""
     device = get_device()
-    logger.info(f"🚀 Starting up on device: {device}")
+    logger.info(f"� Starting up on device: {device}")
 
     # Find all available trained models
     available = find_available_models()
     if available:
         logger.info(f"  📋 Trained models: {list(available.keys())}")
+    else:
+        logger.info("  📋 No trained models found in checkpoints/")
 
-    # ── Load model ───────────────────────────────────────────────────
-    model = MultiModalNet()
+    # Preload default model (AAPL or first available)
+    default_ticker = os.environ.get("SENTIPRICE_TICKER", "AAPL").upper()
     model_loaded = False
     config = {}
 
-    # Determine which ticker model to load
-    default_ticker = os.environ.get("SENTIPRICE_TICKER", "AAPL").upper()
-    paths = get_ticker_paths(default_ticker)
-
-    if os.path.exists(paths["checkpoint"]):
-        logger.info(f"  📦 Loading {default_ticker} model: {paths['checkpoint']}")
-        checkpoint = torch.load(paths["checkpoint"], map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        config = checkpoint.get("config", {})
+    try:
+        model, processor, config = load_ticker_model(default_ticker, device)
         model_loaded = True
-    elif os.path.exists(LEGACY_CHECKPOINT):
-        logger.info(f"  📦 Loading legacy checkpoint: {LEGACY_CHECKPOINT}")
-        checkpoint = torch.load(LEGACY_CHECKPOINT, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        config = checkpoint.get("config", {})
-        model_loaded = True
-    elif os.path.exists(LEGACY_WEIGHTS):
-        logger.info(f"  📦 Loading legacy weights: {LEGACY_WEIGHTS}")
-        model.load_state_dict(torch.load(LEGACY_WEIGHTS, map_location=device))
-        model_loaded = True
-    else:
-        logger.warning("  ⚠️  No model weights found — /predict will return errors.")
-
-    model.to(device).eval()
-
-    # ── Load scaler ──────────────────────────────────────────────────
-    processor = DataPreprocessor()
-    scaler_loaded = False
-    scaler_path = paths["scaler"] if os.path.exists(paths["scaler"]) else LEGACY_SCALER
-    if os.path.exists(scaler_path):
-        processor.load_scaler(scaler_path)
-        scaler_loaded = True
-        logger.info(f"  📦 Scaler loaded ({len(processor.feature_names)} features)")
-    else:
-        logger.warning("  ⚠️  No scaler found — predictions may be inaccurate.")
+        total_params = sum(p.numel() for p in model.parameters())
+        logger.info(f"  ✅ Default model ({default_ticker}) ready — {total_params:,} parameters")
+    except HTTPException:
+        # Try loading any available model
+        if available:
+            first_ticker = list(available.keys())[0]
+            try:
+                model, processor, config = load_ticker_model(first_ticker, device)
+                model_loaded = True
+                logger.info(f"  ✅ Loaded {first_ticker} as default model")
+            except Exception:
+                logger.warning("  ⚠️  Could not load any model")
+        else:
+            logger.warning("  ⚠️  No model weights found — /predict will load on first request")
 
     # ── Store in app.state ───────────────────────────────────────────
-    application.state.model = model
     application.state.device = device
-    application.state.processor = processor
-    application.state.config = config
     application.state.model_loaded = model_loaded
-    application.state.scaler_loaded = scaler_loaded
+    application.state.config = config
     application.state.start_time = datetime.now(timezone.utc)
     application.state.available_models = available
 
-    total_params = sum(p.numel() for p in model.parameters())
-    logger.info(f"  ✅ Model ready — {total_params:,} parameters")
     logger.info(f"  🌐 API is live\n")
 
     yield  # ← app runs here
@@ -205,14 +257,15 @@ class PredictionResponse(BaseModel):
     sentiment_label: str
     timestamp: str
     model_device: str
+    model_ticker: str  # which ticker's model was used
 
 class HealthResponse(BaseModel):
     status: str
     model_loaded: bool
-    scaler_loaded: bool
     device: str
     uptime_seconds: float
     timestamp: str
+    available_models: list
 
 class ModelInfoResponse(BaseModel):
     total_parameters: int
@@ -255,29 +308,50 @@ async def health_check():
     """Liveness probe — returns model & system status."""
     now = datetime.now(timezone.utc)
     uptime = (now - app.state.start_time).total_seconds()
+    available = find_available_models()
     return HealthResponse(
         status="healthy" if app.state.model_loaded else "degraded",
         model_loaded=app.state.model_loaded,
-        scaler_loaded=app.state.scaler_loaded,
         device=str(app.state.device),
         uptime_seconds=round(uptime, 1),
         timestamp=now.isoformat(),
+        available_models=list(available.keys()),
     )
+
+
+# ── Available Models ─────────────────────────────────────────────────
+@app.get("/models", tags=["System"])
+async def list_models():
+    """List all trained ticker models available for prediction."""
+    available = find_available_models()
+    cached = list(_model_cache.keys())
+    return {
+        "available_models": list(available.keys()),
+        "cached_models": cached,
+        "total": len(available),
+    }
 
 
 # ── Model Info ───────────────────────────────────────────────────────
 @app.get("/model/info", response_model=ModelInfoResponse, tags=["System"])
-async def model_info():
-    """Returns architecture details and training configuration."""
-    m = app.state.model
-    total = sum(p.numel() for p in m.parameters())
-    trainable = sum(p.numel() for p in m.parameters() if p.requires_grad)
+async def model_info(ticker: str = Query(default="AAPL", description="Ticker to get model info for")):
+    """Returns architecture details and training configuration for a specific ticker model."""
+    device = app.state.device
+    try:
+        model, processor, config = load_ticker_model(ticker, device)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return ModelInfoResponse(
         total_parameters=total,
         trainable_parameters=trainable,
-        training_config=app.state.config,
-        feature_names=getattr(app.state.processor, "feature_names", []),
-        architecture=m.__class__.__name__,
+        training_config=config,
+        feature_names=getattr(processor, "feature_names", []),
+        architecture=model.__class__.__name__,
     )
 
 
@@ -285,19 +359,20 @@ async def model_info():
 @app.post("/predict", response_model=PredictionResponse, tags=["Prediction"])
 async def predict_price(req: PredictionRequest):
     """
-    Fetch live market data, run through the model, and return
-    the next-hour price prediction with sentiment context.
+    Fetch live market data, dynamically load the correct ticker model,
+    and return the next-hour price prediction with sentiment context.
     """
-    if not app.state.model_loaded:
-        raise HTTPException(
-            status_code=503,
-            detail="Model not loaded. Run train.py first.",
-        )
+    ticker = req.ticker.upper()
+    device = app.state.device
 
     t0 = time.time()
 
     try:
-        # 1. Fetch live data (with lock to avoid concurrent yfinance issues)
+        # 1. Load the ticker-specific model (cached after first load)
+        model, processor, config = load_ticker_model(ticker, device)
+        model_ticker = config.get("ticker", ticker)
+
+        # 2. Fetch live data (with lock to avoid concurrent yfinance issues)
         async with _fetch_lock:
             data_loader = MarketDataLoader(req.ticker)
             df = data_loader.get_aligned_data(days=req.days)
@@ -309,8 +384,7 @@ async def predict_price(req: PredictionRequest):
                        f"Got {len(df)} rows, need ≥25.",
             )
 
-        # 2. Preprocess
-        processor = app.state.processor
+        # 3. Preprocess
         X, _ = processor.create_sequences(df)
 
         if len(X) == 0:
@@ -319,15 +393,13 @@ async def predict_price(req: PredictionRequest):
                 detail="Could not create sequences from the data.",
             )
 
-        # 3. Predict
-        device = app.state.device
-        model = app.state.model
+        # 4. Predict
         latest_seq = X[-1].unsqueeze(0).to(device)
 
         with torch.no_grad():
             pred_scaled = model(latest_seq).cpu().numpy()
 
-        # 4. Inverse transform
+        # 5. Inverse transform
         price_predicted = float(processor.inverse_transform(pred_scaled)[0])
         current_price = float(df["Close"].iloc[-1])
         sentiment = float(df["Sentiment"].iloc[-1])
@@ -337,7 +409,8 @@ async def predict_price(req: PredictionRequest):
         elapsed = time.time() - t0
         logger.info(
             f"  🔮 {req.ticker}  ${current_price:.2f} → ${price_predicted:.2f}  "
-            f"({change_pct:+.2f}%)  sentiment={sentiment:.3f}  [{elapsed:.2f}s]"
+            f"({change_pct:+.2f}%)  sentiment={sentiment:.3f}  "
+            f"model={model_ticker}  [{elapsed:.2f}s]"
         )
 
         return PredictionResponse(
@@ -350,6 +423,7 @@ async def predict_price(req: PredictionRequest):
             sentiment_label=_sentiment_label(sentiment),
             timestamp=datetime.now(timezone.utc).isoformat(),
             model_device=str(device),
+            model_ticker=model_ticker,
         )
 
     except HTTPException:

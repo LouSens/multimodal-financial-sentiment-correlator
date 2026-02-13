@@ -263,6 +263,10 @@ with st.sidebar:
             unsafe_allow_html=True,
         )
         st.caption(f"Uptime: {health['uptime_seconds']:.0f}s")
+        # Show available models
+        avail = health.get("available_models", [])
+        if avail:
+            st.caption(f"Trained models: {', '.join(avail)}")
     else:
         st.markdown(
             '<span class="status-dot status-offline"></span> **API:** Offline',
@@ -273,15 +277,15 @@ with st.sidebar:
     st.markdown("---")
 
     # ── Controls ─────────────────────────────────────────────────
-    ticker = st.text_input("📈 Ticker Symbol", value="AAPL", key="ticker_input")
+    ticker = st.text_input("📈 Ticker Symbol", value="AAPL", key="ticker_input").upper()
     days = st.slider("📅 History (days)", min_value=2, max_value=60, value=14, key="days_slider")
     analyze_btn = st.button("⚡ Analyze", use_container_width=True, type="primary")
 
     st.markdown("---")
 
-    # ── Model Info ───────────────────────────────────────────────
+    # ── Model Info (ticker-specific) ─────────────────────────────
     with st.expander("🔧 Model Info"):
-        model_info, info_err = api_get("/model/info")
+        model_info, info_err = api_get("/model/info", params={"ticker": ticker})
         if model_info:
             st.code(f"Architecture: {model_info['architecture']}")
             st.code(f"Parameters: {model_info['total_parameters']:,}")
@@ -293,6 +297,9 @@ with st.sidebar:
                     f"LR: {cfg.get('lr', 'N/A')} · "
                     f"Epochs: {cfg.get('epochs', 'N/A')}"
                 )
+        elif info_err and "404" in str(info_err):
+            st.warning(f"No trained model for {ticker}")
+            st.caption(f"Train with: `python train.py --ticker {ticker}`")
         else:
             st.caption("Model info unavailable")
 
@@ -322,6 +329,11 @@ if analyze_btn:
     if pred_err:
         st.error(f"⚠️ Prediction Error: {pred_err}")
     elif pred_data:
+        # ── Model Used Indicator ─────────────────────────────────
+        model_used = pred_data.get("model_ticker", ticker)
+        if model_used != ticker:
+            st.info(f"ℹ️ Using **{model_used}** model for {ticker} (no {ticker}-specific model trained)")
+
         # ── KPI Metric Cards ─────────────────────────────────────
         st.markdown('<div class="section-title">📊 Prediction Summary</div>', unsafe_allow_html=True)
 
