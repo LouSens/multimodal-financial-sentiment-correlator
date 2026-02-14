@@ -5,7 +5,7 @@ All data comes from Yahoo Finance:
   • Price & Volume  : yf.download()     — hourly OHLCV
   • News Sentiment  : yf.Ticker().news  — recent headlines scored with BERT
 
-No CSV files, no API keys. One source of truth.
+Refactored for strict time-alignment and reduced noise.
 """
 
 import yfinance as yf
@@ -20,6 +20,7 @@ from tqdm import tqdm
 
 # Cache file for pre-computed BERT sentiment scores
 CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sentiment_cache.csv")
+MAX_NEWS_AGE_DAYS = 7  # yfinance usually only gives ~7 days of news
 
 
 class MarketDataLoader:
@@ -28,7 +29,8 @@ class MarketDataLoader:
         self._interval = "1h"
 
         # Load BERT model & tokenizer for sentiment classification
-        print("Loading BERT sentiment model...")
+        # Suppress extensive loading logs usually
+        print(f"[{self.ticker}] Initializing MarketDataLoader...")
         self.tokenizer = BertTokenizer.from_pretrained(
             "nlptown/bert-base-multilingual-uncased-sentiment"
         )
@@ -42,8 +44,8 @@ class MarketDataLoader:
     # ------------------------------------------------------------------ #
     def fetch_price_data(self, start_date, end_date, interval="1h"):
         """Fetches OHLCV data from Yahoo Finance with UTC-normalized index."""
-        print(f"Fetching price data for {self.ticker} ({interval})...")
-        df = yf.download(self.ticker, start=start_date, end=end_date, interval=interval)
+        # Simple, clean fetch
+        df = yf.download(self.ticker, start=start_date, end=end_date, interval=interval, progress=False)
 
         if df.empty:
             raise ValueError(f"No price data found for {self.ticker}.")
@@ -59,7 +61,6 @@ class MarketDataLoader:
             df.index = df.index.tz_convert("UTC")
 
         self._interval = interval
-        print(f"  📊 Price data: {len(df)} rows ({interval})")
         return df[['Close', 'Volume']]
 
     # ------------------------------------------------------------------ #
@@ -68,84 +69,75 @@ class MarketDataLoader:
     def _fetch_yfinance_news(self):
         """
         Fetches recent news headlines directly from Yahoo Finance.
-        Handles multiple yfinance API versions (field names change across versions).
-        Returns a DataFrame with columns: headline, date.
+        Returns a DataFrame with columns: headline, summary, provider, url, date.
         """
-        print(f"  📡 Fetching live news from Yahoo Finance...")
         try:
             ticker_obj = yf.Ticker(self.ticker)
             news_items = ticker_obj.news
-
+            
             if not news_items:
-                print("  ⚠ No live news returned.")
                 return None
 
             records = []
             for item in news_items:
-                # --- Extract title (multiple possible field names) ---
-                title = (
-                    item.get("title")
-                    or item.get("headline")
-                    or (item.get("content", {}) or {}).get("title")
-                    or ""
+                # Content extracted from 'content' dictionary or top-level
+                content = item.get("content", {})
+                
+                # Title
+                title = item.get("title") or item.get("headline") or content.get("title") or ""
+                
+                # Summary (Key new feature)
+                summary = content.get("summary") or item.get("summary") or ""
+                
+                # Provider
+                provider_data = content.get("provider") or item.get("provider") or {}
+                provider = provider_data.get("displayName") or "Yahoo Finance"
+                
+                # URL
+                url = (
+                    content.get("clickThroughUrl") 
+                    or content.get("canonicalUrl") 
+                    or item.get("link") 
+                    or f"https://finance.yahoo.com/quote/{self.ticker}"
                 )
-
-                # --- Extract timestamp (multiple possible formats) ---
+                
+                # Get Date (Robust parsing)
                 dt = None
-
-                # Format 1: Unix timestamp (older yfinance)
-                pub_time = item.get("providerPublishTime")
-                if pub_time and isinstance(pub_time, (int, float)):
-                    dt = pd.to_datetime(pub_time, unit="s", utc=True)
-
-                # Format 2: ISO string in 'publish_time' or 'pubDate'
+                
+                # 1. Unix timestamp
+                if "providerPublishTime" in item:
+                    dt = pd.to_datetime(item["providerPublishTime"], unit="s", utc=True)
+                elif "pubDate" in content:
+                     try: dt = pd.to_datetime(content["pubDate"], utc=True)
+                     except: pass
+                
+                # 2. ISO Strings fallback
                 if dt is None:
                     for key in ["publish_time", "pubDate"]:
                         val = item.get(key)
                         if val:
                             try:
                                 dt = pd.to_datetime(val, utc=True)
-                            except Exception:
-                                pass
-                            if dt is not None:
                                 break
-
-                # Format 3: Nested in 'content' dict (newest yfinance)
-                if dt is None:
-                    content = item.get("content", {}) or {}
-                    for key in ["pubDate", "publish_time", "providerPublishTime"]:
-                        val = content.get(key)
-                        if val:
-                            try:
-                                if isinstance(val, (int, float)):
-                                    dt = pd.to_datetime(val, unit="s", utc=True)
-                                else:
-                                    dt = pd.to_datetime(val, utc=True)
-                            except Exception:
-                                pass
-                            if dt is not None:
-                                break
-
-                # Format 4: Use current time as fallback if title exists
-                if dt is None and title:
-                    dt = pd.Timestamp.now(tz="UTC")
-
-                if not title or dt is None:
-                    continue
-
-                records.append({"headline": title.strip(), "date": dt})
+                            except: pass
+                
+                if title and dt:
+                    records.append({
+                        "headline": title.strip(),
+                        "summary": summary.strip(),
+                        "provider": provider,
+                        "url": url.get("url") if isinstance(url, dict) else url,
+                        "date": dt
+                    })
 
             if not records:
-                print("  ⚠ No parseable headlines.")
                 return None
 
             df = pd.DataFrame(records)
-            print(f"  ✅ {len(df)} headlines retrieved "
-                  f"({df['date'].min().date()} → {df['date'].max().date()})")
             return df
 
         except Exception as e:
-            print(f"  ⚠ News fetch failed: {e}")
+            print(f"  Warning: News fetch failed: {e}")
             return None
 
     # ------------------------------------------------------------------ #
@@ -153,10 +145,11 @@ class MarketDataLoader:
     # ------------------------------------------------------------------ #
     def _score_sentiment(self, text):
         """
-        Scores a headline with BERT → returns sentiment in [-1, 1].
+        Scores text with BERT → returns sentiment in [-1, 1].
         Maps 5-star rating: 1★ = -1.0, 3★ = 0.0, 5★ = +1.0
         """
         try:
+            # text is now likely "Headline. Summary"
             inputs = self.tokenizer(
                 str(text), return_tensors="pt", truncation=True, max_length=512
             )
@@ -174,15 +167,16 @@ class MarketDataLoader:
     # ------------------------------------------------------------------ #
     def _load_cache(self):
         if os.path.exists(CACHE_FILE):
-            print("  📦 Loading sentiment cache...")
-            cache = pd.read_csv(CACHE_FILE)
-            cache["date"] = pd.to_datetime(cache["date"], utc=True)
-            return cache
+            try:
+                cache = pd.read_csv(CACHE_FILE)
+                cache["date"] = pd.to_datetime(cache["date"], utc=True)
+                return cache
+            except:
+                return None
         return None
 
     def _save_cache(self, df):
         df.to_csv(CACHE_FILE, index=False)
-        print(f"  💾 Cache saved ({len(df)} entries)")
 
     # ------------------------------------------------------------------ #
     #  Sentiment Pipeline
@@ -193,30 +187,23 @@ class MarketDataLoader:
           1. Fetch headlines from yfinance
           2. Score with BERT (using cache)
           3. Aggregate to hourly sentiment
-          4. Falls back to mock if no news available
         """
-        print(f"Computing sentiment for {self.ticker}...")
-
         start_dt = pd.to_datetime(start_date, utc=True)
         end_dt = pd.to_datetime(end_date, utc=True)
 
         # --- Fetch live news ---
         news_df = self._fetch_yfinance_news()
 
+        # If absolutely no news, return empty with correct index so alignment works (as 0.0)
         if news_df is None or news_df.empty:
-            print("  ⚠ No news available. Using mock sentiment.")
-            return self._generate_mock_sentiment(start_date, end_date)
+            return pd.DataFrame(columns=["Sentiment"])
 
-        # Filter to date range
-        filtered = news_df[
-            (news_df["date"] >= start_dt) & (news_df["date"] <= end_dt)
-        ].copy()
-
-        if filtered.empty:
-            # News exists but outside our range — spread the sentiment
-            # across the full range since these are the closest headlines
-            print(f"  ℹ Headlines outside date range. Using all {len(news_df)} headlines.")
-            filtered = news_df.copy()
+        # Filter strictly to date range? 
+        # Actually, for yfinance news, it only gives RECENT news. 
+        # We should NOT filter extensively if the user asks for historical data
+        # because we only have the tail end. We will let alignment handle the gaps.
+        
+        filtered = news_df.copy()
 
         # --- Score with BERT (cached) ---
         cache = self._load_cache()
@@ -224,57 +211,54 @@ class MarketDataLoader:
             cached_set = set(cache["headline"].tolist())
             needs_scoring = filtered[~filtered["headline"].isin(cached_set)]
             already_scored = filtered[filtered["headline"].isin(cached_set)]
-
+            
             if not already_scored.empty:
+                # Merge to get the sentiment score
                 already_scored = already_scored.merge(
                     cache[["headline", "Sentiment"]], on="headline", how="left"
                 )
 
             if not needs_scoring.empty:
-                print(f"  Scoring {len(needs_scoring)} new headlines with BERT...")
-                tqdm.pandas(desc="  🧠 BERT")
+                # print(f"  Scoring {len(needs_scoring)} new headlines...")
+                tqdm.pandas(desc="  BERT Scoring")
                 needs_scoring = needs_scoring.copy()
-                needs_scoring["Sentiment"] = needs_scoring["headline"].progress_apply(
+                
+                # Combine Headline + Summary for scoring
+                needs_scoring["text_to_score"] = needs_scoring["headline"] + ". " + needs_scoring["summary"]
+                
+                needs_scoring["Sentiment"] = needs_scoring["text_to_score"].progress_apply(
                     self._score_sentiment
                 )
+                
+                # Update Cache
                 new_cache = pd.concat([
                     cache, needs_scoring[["headline", "date", "Sentiment"]]
                 ])
                 self._save_cache(new_cache)
-            else:
-                print("  ✅ All headlines cached — skipping BERT.")
-                needs_scoring = pd.DataFrame()
-
+            
             parts = [df for df in [already_scored, needs_scoring] if not df.empty]
             filtered = pd.concat(parts, ignore_index=True) if parts else already_scored
         else:
-            print(f"  Scoring {len(filtered)} headlines with BERT (first run)...")
-            tqdm.pandas(desc="  🧠 BERT")
-            filtered["Sentiment"] = filtered["headline"].progress_apply(
+            # First run
+            print(f"  Scoring {len(filtered)} items (Headline + Summary)...")
+            tqdm.pandas(desc="  BERT Scoring")
+            
+            filtered["text_to_score"] = filtered["headline"] + ". " + filtered["summary"]
+            filtered["Sentiment"] = filtered["text_to_score"].progress_apply(
                 self._score_sentiment
             )
             self._save_cache(filtered[["headline", "date", "Sentiment"]])
 
         # --- Aggregate to hourly ---
+        # Reduce to hourly mean
         filtered["date"] = pd.to_datetime(filtered["date"], utc=True)
-        filtered = filtered.set_index("date")
+        filtered = filtered.set_index("date").sort_index()
+        
+        # Resample to hourly to match price candles
         hourly = filtered["Sentiment"].resample("1h").mean()
         hourly = hourly.to_frame(name="Sentiment")
-
-        scored_count = filtered["Sentiment"].notna().sum()
-        avg_sent = filtered["Sentiment"].mean()
-        print(f"  📰 Sentiment: {scored_count} scored, avg = {avg_sent:.3f}")
+        
         return hourly
-
-    # ------------------------------------------------------------------ #
-    #  Mock Sentiment (Fallback)
-    # ------------------------------------------------------------------ #
-    def _generate_mock_sentiment(self, start_date, end_date):
-        """Generates random sentiment when no news is available."""
-        print("  🎲 Mock sentiment mode")
-        dates = pd.date_range(start=start_date, end=end_date, freq="1h", tz="UTC")
-        sentiments = [random.uniform(-0.8, 0.8) for _ in range(len(dates))]
-        return pd.DataFrame({"Sentiment": sentiments}, index=dates)
 
     # ------------------------------------------------------------------ #
     #  Alignment (main entry point)
@@ -282,63 +266,63 @@ class MarketDataLoader:
     def get_aligned_data(self, days=90):
         """
         Fetches price + sentiment and returns an aligned DataFrame.
-        Uses yfinance for both price and news → same ticker, same dates.
+        Strict alignment: Price at T is matched with News BEFORE T.
         """
         end = datetime.now()
         start = end - timedelta(days=days)
 
-        price_df = self.fetch_price_data(start, end, interval="1h")
+        # 1. Get Price
+        try:
+            price_df = self.fetch_price_data(start, end, interval="1h")
+        except Exception as e:
+            print(f"Error fetching price for {self.ticker}: {e}")
+            return pd.DataFrame()
+
+        # 2. Get Sentiment
         sentiment_df = self.fetch_news_sentiment(start, end)
 
-        # Timezone Normalization (Force UTC)
-        if price_df.index.tz is None:
-            price_df.index = price_df.index.tz_localize("UTC")
-        else:
-            price_df.index = price_df.index.tz_convert("UTC")
-            
-        if sentiment_df.index.tz is None:
-            sentiment_df.index = sentiment_df.index.tz_localize("UTC")
-        else:
-            sentiment_df.index = sentiment_df.index.tz_convert("UTC")
-
-        # DEBUG: Print exact index values for diagnosis
-        if not price_df.empty and not sentiment_df.empty:
-            print("\n  🔍 DEBUG: Merge Pre-Check")
-            print(f"  Price Head (UTC): {price_df.index[:5]}")
-            print(f"  Sent Head (UTC):  {sentiment_df.index[:5]}")
-            print(f"  Price Tail (UTC): {price_df.index[-5:]}")
-            print(f"  Sent Tail (UTC):  {sentiment_df.index[-5:]}")
-        
-        # Merge with loose alignment (nearest sentiment to price point)
-        # using 'nearest' helps bridge overnight gaps (e.g. attach 8am news to prev 4pm close)
-        # ensuring we capture the latest sentiment signal even if market was closed.
+        # 3. Align
+        # Sort both
         price_df = price_df.sort_index()
         sentiment_df = sentiment_df.sort_index()
-        
-        combined = pd.merge_asof(
-            price_df,
-            sentiment_df,
-            left_index=True,
-            right_index=True,
-            direction="nearest", 
-            tolerance=pd.Timedelta("48h")
-        )
 
-        # Forward fill any gaps if merge_asof missed (unlikely with backward)
-        combined["Sentiment"] = combined["Sentiment"].ffill().fillna(0.0)
+        # Merge Logic:
+        # We use merge_asof with direction='backward'.
+        # For a price candle at 10:00, we look for the most recent sentiment reading
+        # at or before 10:00. 
+        # Tolerance: 12 hours. If no news in last 12h, sentiment = 0 (Neutral).
+        
+        if sentiment_df.empty:
+            # No news at all -> all neutral
+            combined = price_df.copy()
+            combined["Sentiment"] = 0.0
+        else:
+            combined = pd.merge_asof(
+                price_df,
+                sentiment_df,
+                left_index=True,
+                right_index=True,
+                direction="backward",
+                tolerance=pd.Timedelta("12h")
+            )
+            # Fill NaN sentiment with 0.0 (Neutral)
+            combined["Sentiment"] = combined["Sentiment"].fillna(0.0)
+
+        # Drop any rows with missing price data
         combined = combined.dropna(subset=["Close", "Volume"])
 
+        # Statistics
         non_zero = (combined["Sentiment"] != 0.0).sum()
-        print(f"\n  ✅ Final dataset: {len(combined)} rows, "
-              f"{non_zero} with real sentiment ({non_zero/len(combined)*100:.1f}%)")
+        total = len(combined)
+        # print(f"  Aligned {total} rows. Non-zero sentiment: {non_zero} ({non_zero/total:.1%})")
+        
         return combined
 
 
-# Quick Test
 if __name__ == "__main__":
+    # Test
     loader = MarketDataLoader("AAPL")
-    data = loader.get_aligned_data(days=30)
-    print(data.head(10))
-    print(f"\nShape: {data.shape}")
-    print(f"Sentiment range: [{data['Sentiment'].min():.3f}, {data['Sentiment'].max():.3f}]")
-    print(f"Non-zero sentiment: {(data['Sentiment'] != 0).sum()} / {len(data)}")
+    df = loader.get_aligned_data(days=10)
+    print(df.tail(20))
+    print(f"Non-zero sentiment count: {(df['Sentiment'] != 0).sum()}")
+

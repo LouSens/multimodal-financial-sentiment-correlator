@@ -384,6 +384,7 @@ async def predict_price(req: PredictionRequest):
             df = data_loader.get_aligned_data(days=req.days)
 
         if df.empty or len(df) < 25:
+            # Try to fetch more history if possible, otherwise error
             raise HTTPException(
                 status_code=422,
                 detail=f"Not enough data for '{req.ticker}'. "
@@ -408,7 +409,10 @@ async def predict_price(req: PredictionRequest):
         # 5. Inverse transform
         price_predicted = float(processor.inverse_transform(pred_scaled)[0])
         current_price = float(df["Close"].iloc[-1])
+        
+        # Handle sentiment - might be 0.0 if no recent news
         sentiment = float(df["Sentiment"].iloc[-1])
+        
         change = price_predicted - current_price
         change_pct = (change / current_price) * 100 if current_price != 0 else 0.0
 
@@ -436,6 +440,8 @@ async def predict_price(req: PredictionRequest):
         raise
     except Exception as e:
         logger.error(f"  ❌ Prediction failed for {req.ticker}: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 

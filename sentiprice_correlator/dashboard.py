@@ -595,6 +595,93 @@ st.markdown("""
 
 
 # ===================================================================== #
+#  Market Scanner Section
+# ===================================================================== #
+st.markdown('<div class="section-title">📡 Market Sentiment Scanner</div>', unsafe_allow_html=True)
+
+with st.expander("Explore Real-Time Market Sentiment", expanded=False):
+    st.caption("Scans the latest news (Headlines + Summaries) for your watchlist.")
+    
+    # Scanner Inputs
+    col_scan1, col_scan2 = st.columns([3, 1])
+    with col_scan1:
+        default_tickers = "AAPL, MSFT, TSLA, NVDA, AMZN, GOOGL, META, GME, AMC, SPY"
+        watchlist = st.text_input("Watchlist (comma separated)", value=default_tickers)
+    
+    with col_scan2:
+        st.markdown("<br>", unsafe_allow_html=True) # Spacer
+        scan_btn = st.button("🚀 Scan Market", use_container_width=True)
+
+    if scan_btn:
+        tickers = [t.strip().upper() for t in watchlist.split(",") if t.strip()]
+        
+        with st.spinner(f"Scanning {len(tickers)} tickers via API..."):
+            # Call API instead of local import
+            scan_data, scan_err = api_post("/scan_market", {"tickers": tickers})
+            
+        if scan_err:
+            st.error(f"⚠️ Scanner Error: {scan_err}")
+        elif scan_data and scan_data.get("results"):
+            scan_df = pd.DataFrame(scan_data["results"])
+            
+            # 1. Bar Chart of Sentiment
+            fig_scan = go.Figure()
+            colors = [
+                "#34d399" if s >= 0.3 else "#f87171" if s <= -0.3 else "#fbbf24"
+                for s in scan_df["Sentiment Score"]
+            ]
+            fig_scan.add_trace(go.Bar(
+                x=scan_df["Ticker"],
+                y=scan_df["Sentiment Score"],
+                marker_color=colors,
+                text=scan_df["Sentiment Score"].round(2),
+                textposition='auto',
+            ))
+            fig_scan.update_layout(
+                title="Sentiment Ranking",
+                template="plotly_dark",
+                height=300,
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(family="Inter", color="rgba(255,255,255,0.7)"),
+                yaxis=dict(range=[-1.1, 1.1])
+            )
+            st.plotly_chart(fig_scan, use_container_width=True)
+            
+            # 2. Detailed Table with Links
+            st.markdown("### 📰 Top Stories")
+            for _, row in scan_df.iterrows():
+                # Card-like layout for each ticker
+                score = row['Sentiment Score']
+                color = "#34d399" if score >= 0.3 else "#f87171" if score <= -0.3 else "#fbbf24"
+                
+                with st.container():
+                    st.markdown(f"""
+                    <div style="
+                        background: rgba(255,255,255,0.03); 
+                        border-left: 4px solid {color};
+                        padding: 1rem; 
+                        border-radius: 8px;
+                        margin-bottom: 0.8rem;">
+                        <div style="display:flex; justify-content:space-between; align-items:center;">
+                            <h3 style="margin:0; color:#fff;">{row['Ticker']} <span style="font-size:0.8em; opacity:0.7;">({row['Sentiment Label']})</span></h3>
+                            <span style="font-weight:bold; color:{color}; font-size:1.1em;">{score:.2f}</span>
+                        </div>
+                        <p style="margin: 0.5rem 0; font-size: 0.95rem; font-weight: 500; color: #e2e8f0;">{row['Top Headline']}</p>
+                        <p style="margin: 0; font-size: 0.85rem; color: #94a3b8;">{row['Top Summary']}</p>
+                        <div style="margin-top: 0.5rem; font-size: 0.75rem; color: #64748b;">
+                            Source: {row['Provider']} • <a href="{row['URL']}" target="_blank" style="color: #60a5fa; text-decoration: none;">Read Full Story ↗</a>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+        else:
+            st.warning("No recent news found for these tickers.")
+
+st.markdown('<hr class="custom-divider">', unsafe_allow_html=True)
+
+
+# ===================================================================== #
 #  Main Content
 # ===================================================================== #
 if analyze_btn:
