@@ -23,7 +23,29 @@ import requests
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime
+from datetime import datetime, timezone
+
+def is_market_open() -> bool:
+    """Simple check for US Market Hours (Mon-Fri 9:30-16:00 ET)."""
+    # ET is roughly UTC-5 (standard) or UTC-4 (daylight)
+    # For simplicity/robustness without heavy libs, we'll use UTC-5
+    now_utc = datetime.now(timezone.utc)
+    
+    # Check Weekend
+    if now_utc.weekday() >= 5:  # 5=Sat, 6=Sun
+        return False
+        
+    # Convert to roughly ET (UTC-5)
+    # hour in 24h format
+    hour_et = (now_utc.hour - 5) % 24
+    minute = now_utc.minute
+    
+    # Market hours: 09:30 to 16:00
+    current_time = hour_et * 60 + minute
+    start_time = 9 * 60 + 30
+    end_time = 16 * 60
+    
+    return start_time <= current_time < end_time
 
 # ===================================================================== #
 #  Page Config
@@ -649,13 +671,15 @@ with st.expander("Explore Real-Time Market Sentiment", expanded=False):
             st.plotly_chart(fig_scan, use_container_width=True)
             
             # 2. Detailed Table with Links
-            st.markdown("### 📰 Top Stories")
+            st.markdown("### 📰 Sentiment & Fundamentals")
+            
             for _, row in scan_df.iterrows():
                 # Card-like layout for each ticker
                 score = row['Sentiment Score']
                 color = "#34d399" if score >= 0.3 else "#f87171" if score <= -0.3 else "#fbbf24"
                 
                 with st.container():
+                    # Top Row: Header + Score
                     st.markdown(f"""
                     <div style="
                         background: rgba(255,255,255,0.03); 
@@ -663,10 +687,22 @@ with st.expander("Explore Real-Time Market Sentiment", expanded=False):
                         padding: 1rem; 
                         border-radius: 8px;
                         margin-bottom: 0.8rem;">
-                        <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 0.5rem;">
                             <h3 style="margin:0; color:#fff;">{row['Ticker']} <span style="font-size:0.8em; opacity:0.7;">({row['Sentiment Label']})</span></h3>
                             <span style="font-weight:bold; color:{color}; font-size:1.1em;">{score:.2f}</span>
                         </div>
+                    """, unsafe_allow_html=True)
+                    
+                    # Middle Row: Fundamentals Grid
+                    c1, c2, c3, c4 = st.columns(4)
+                    with c1: st.metric("P/E Ratio", f"{row.get('P/E Ratio', 'N/A')}")
+                    with c2: st.metric("ROE", f"{row.get('ROE', 'N/A')}")
+                    with c3: st.metric("Margin", f"{row.get('Profit Margin', 'N/A')}")
+                    with c4: st.metric("Analyst", f"{row.get('Recommendation', 'N/A')}")
+                    
+                    # Bottom Row: News
+                    st.markdown(f"""
+                        <hr style="margin: 0.5rem 0; border: 0; border-top: 1px solid rgba(255,255,255,0.1);">
                         <p style="margin: 0.5rem 0; font-size: 0.95rem; font-weight: 500; color: #e2e8f0;">{row['Top Headline']}</p>
                         <p style="margin: 0; font-size: 0.85rem; color: #94a3b8;">{row['Top Summary']}</p>
                         <div style="margin-top: 0.5rem; font-size: 0.75rem; color: #64748b;">
@@ -716,9 +752,13 @@ if analyze_btn:
             chg_cls = delta_class(chg)
             arrow = "▲" if chg > 0 else "▼" if chg < 0 else "●"
             val_color = "color-green" if chg > 0 else "color-red" if chg < 0 else "color-white"
+            
+            # Label logic based on market hours
+            lbl = "Predicted (1hr)" if is_market_open() else "Predicted (Next Open)"
+            
             st.markdown(f"""
             <div class="metric-card">
-                <div class="metric-label">Predicted (1hr)</div>
+                <div class="metric-label">{lbl}</div>
                 <div class="metric-value {val_color}">${pred_data['predicted_next_hour']:,.2f}</div>
                 <div class="metric-delta {chg_cls}">{arrow} ${abs(chg):,.2f}</div>
             </div>
@@ -739,15 +779,57 @@ if analyze_btn:
 
         with c4:
             sent = pred_data["sentiment_score"]
-            sent_cls = sentiment_color(sent)
-            sent_label = sentiment_emoji(sent)
-            st.markdown(f"""
-            <div class="metric-card">
-                <div class="metric-label">Sentiment</div>
-                <div class="metric-value {sent_cls}">{sent:.4f}</div>
-                <div class="metric-delta delta-neutral">{sent_label}</div>
-            </div>
-            """, unsafe_allow_html=True)
+            has_news = pred_data.get("has_news", True)  # Default to True for backward compat if missing
+
+            if not has_news:
+                # ── No News State ──────────────────
+                st.markdown(f"""
+                <div class="metric-card" style="border-color: rgba(255,255,255,0.05); background: rgba(255,255,255,0.02);">
+                    <div class="metric-label">Sentiment</div>
+                    <div class="metric-value color-white" style="font-size: 1.4rem; opacity: 0.6;">No News</div>
+                    <div class="metric-delta" style="color: rgba(255,255,255,0.3);">Last 48h</div>
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                # ── Normal State ──────────────────
+                sent_cls = sentiment_color(sent)
+                sent_label = sentiment_emoji(sent)
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-label">Sentiment</div>
+                    <div class="metric-value {sent_cls}">{sent:.4f}</div>
+                    <div class="metric-delta delta-neutral">{sent_label}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        # ── Extra Spacing ────────────────────────────────────────
+        st.markdown("<br><br>", unsafe_allow_html=True)
+            
+        # ── Fundamentals Section (New) ───────────────────────────
+        fund = pred_data.get("fundamentals", {})
+        if fund:
+            st.markdown('<div class="section-title">🏥 Fundamental Health</div>', unsafe_allow_html=True)
+            f1, f2, f3, f4, f5 = st.columns(5)
+            
+            def safe_fmt(val, is_pct=False, prefix=""):
+                if val is None: return "N/A"
+                if is_pct: return f"{val*100:.1f}%"
+                return f"{prefix}{val:,.2f}"
+
+            def fmt_mcap(val):
+                if not val: return "N/A"
+                if val >= 1e12: return f"{val/1e12:.2f}T"
+                if val >= 1e9: return f"{val/1e9:.2f}B"
+                if val >= 1e6: return f"{val/1e6:.2f}M"
+                return f"{val:,.0f}"
+
+            with f1: st.metric("Market Cap", f"${fmt_mcap(fund.get('market_cap'))}", help="Total value of all shares")
+            with f2: st.metric("P/E Ratio", safe_fmt(fund.get('trailing_pe')), help="Price to Earnings Ratio")
+            with f3: st.metric("ROE", safe_fmt(fund.get('roe'), is_pct=True), help="Return on Equity")
+            with f4: st.metric("Profit Margin", safe_fmt(fund.get('profit_margins'), is_pct=True))
+            with f5: st.metric("Analyst Rec", str(fund.get('recommendation_key', 'N/A')).replace("_", " ").title())
+            
+            st.markdown("<br>", unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
 
@@ -782,23 +864,35 @@ if analyze_btn:
             secondary_y=False,
         )
 
-        # Sentiment markers (color-coded)
+        # Sentiment markers (color-coded) - SPARSE MODE
+        # Only plot points that actually have news
+        if "has_news" in df.columns:
+            sent_df = df[df["has_news"] == True].copy()
+        else:
+            # Fallback if API hasn't updated or column missing
+            sent_df = df[df["sentiment"] != 0.0].copy()
+
         colors = [
             "#34d399" if s >= 0.3 else "#f87171" if s <= -0.3 else "#fbbf24"
-            for s in df["sentiment"]
+            for s in sent_df["sentiment"]
         ]
+        
         fig.add_trace(
             go.Scatter(
-                x=df["timestamp"],
-                y=df["sentiment"],
-                name="Sentiment",
-                mode="lines+markers",
-                line=dict(color="rgba(251, 191, 36, 0.4)", width=1.5),
-                marker=dict(color=colors, size=5, line=dict(width=0)),
+                x=sent_df["timestamp"],
+                y=sent_df["sentiment"],
+                name="Sentiment (News)",
+                mode="markers", # removed lines to show distinct news events
+                marker=dict(
+                    color=colors, 
+                    size=8, 
+                    line=dict(width=1, color="rgba(255,255,255,0.5)")
+                ),
                 hovertemplate="%{y:.3f}<extra>Sentiment</extra>",
             ),
             secondary_y=True,
         )
+
 
         fig.update_layout(
             template="plotly_dark",
@@ -881,7 +975,8 @@ if analyze_btn:
         # ── Raw Data Expander ────────────────────────────────────
         # ── Raw Data Table ──────────────────────────────────────
         with st.expander("📄 Raw Data Table"):
-            display_df = df.copy()
+            # Explicitly select columns to match names (exclude metadata like 'has_news')
+            display_df = df[["timestamp", "close", "volume", "sentiment"]].copy()
             display_df["timestamp"] = display_df["timestamp"].dt.strftime("%Y-%m-%d %H:%M")
             display_df.columns = ["Timestamp", "Close ($)", "Volume", "Sentiment"]
             st.dataframe(

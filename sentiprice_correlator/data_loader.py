@@ -296,6 +296,7 @@ class MarketDataLoader:
             # No news at all -> all neutral
             combined = price_df.copy()
             combined["Sentiment"] = 0.0
+            combined["has_news"] = False
         else:
             combined = pd.merge_asof(
                 price_df,
@@ -303,8 +304,12 @@ class MarketDataLoader:
                 left_index=True,
                 right_index=True,
                 direction="backward",
-                tolerance=pd.Timedelta("12h")
+                tolerance=pd.Timedelta("48h")  # Relaxed from 12h to 48h for better coverage
             )
+            
+            # Track if news was truly present vs filled
+            combined["has_news"] = combined["Sentiment"].notna()
+            
             # Fill NaN sentiment with 0.0 (Neutral)
             combined["Sentiment"] = combined["Sentiment"].fillna(0.0)
 
@@ -318,11 +323,61 @@ class MarketDataLoader:
         
         return combined
 
+    # ------------------------------------------------------------------ #
+    #  Fundamental Data (New)
+    # ------------------------------------------------------------------ #
+    def get_fundamentals(self):
+        """
+        Fetches a broad set of fundamental metrics for the 'Tri-Modal' view.
+        Returns a dictionary with raw values (or None if missing).
+        """
+        try:
+            ticker = yf.Ticker(self.ticker)
+            info = ticker.info or {}
+            
+            return {
+                # Valuation
+                "market_cap": info.get("marketCap"),
+                "trailing_pe": info.get("trailingPE"),
+                "forward_pe": info.get("forwardPE"),
+                "price_to_sales": info.get("priceToSalesTrailing12Months"),
+                "price_to_book": info.get("priceToBook"),
+                
+                # Profitability
+                "profit_margins": info.get("profitMargins"),
+                "roe": info.get("returnOnEquity"),
+                "ebitda_margins": info.get("ebitdaMargins"),
+                
+                # Health
+                "debt_to_equity": info.get("debtToEquity"),
+                "free_cash_flow": info.get("freeCashflow"),
+                "current_ratio": info.get("currentRatio"),
+                
+                # Growth
+                "revenue_growth": info.get("revenueGrowth"),
+                "earnings_growth": info.get("earningsGrowth"),
+                
+                # Analyst
+                "recommendation_key": info.get("recommendationKey"),
+                "target_mean_price": info.get("targetMeanPrice"),
+                "num_analysts": info.get("numberOfAnalystOpinions")
+            }
+        except Exception as e:
+            print(f"  Warning: Fundamental fetch failed for {self.ticker}: {e}")
+            return {}
+
 
 if __name__ == "__main__":
     # Test
     loader = MarketDataLoader("AAPL")
+    
+    print("--- Fundamentals ---")
+    fund = loader.get_fundamentals()
+    import json
+    print(json.dumps(fund, indent=2))
+    
+    print("\n--- Aligned Data (Tail) ---")
     df = loader.get_aligned_data(days=10)
-    print(df.tail(20))
+    print(df.tail(10))
     print(f"Non-zero sentiment count: {(df['Sentiment'] != 0).sum()}")
 

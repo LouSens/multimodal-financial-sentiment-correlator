@@ -264,6 +264,8 @@ class PredictionResponse(BaseModel):
     timestamp: str
     model_device: str
     model_ticker: str  # which ticker's model was used
+    fundamentals: dict = {}
+    has_news: bool = False
 
 class HealthResponse(BaseModel):
     status: str
@@ -285,6 +287,7 @@ class HistoryPoint(BaseModel):
     close: float
     volume: float
     sentiment: float
+    has_news: bool = False
 
 class HistoryResponse(BaseModel):
     ticker: str
@@ -406,20 +409,25 @@ async def predict_price(req: PredictionRequest):
         with torch.no_grad():
             pred_scaled = model(latest_seq).cpu().numpy()
 
+
         # 5. Inverse transform
         price_predicted = float(processor.inverse_transform(pred_scaled)[0])
         current_price = float(df["Close"].iloc[-1])
         
         # Handle sentiment - might be 0.0 if no recent news
         sentiment = float(df["Sentiment"].iloc[-1])
+        has_news = bool(df["has_news"].iloc[-1]) if "has_news" in df.columns else False
         
         change = price_predicted - current_price
         change_pct = (change / current_price) * 100 if current_price != 0 else 0.0
 
+        # Create fundamental context for the dashboard
+        fund = data_loader.get_fundamentals()
+
         elapsed = time.time() - t0
         logger.info(
             f"  🔮 {req.ticker}  ${current_price:.2f} → ${price_predicted:.2f}  "
-            f"({change_pct:+.2f}%)  sentiment={sentiment:.3f}  "
+            f"({change_pct:+.2f}%)  sentiment={sentiment:.3f} (news={has_news})  "
             f"model={model_ticker}  [{elapsed:.2f}s]"
         )
 
@@ -434,6 +442,8 @@ async def predict_price(req: PredictionRequest):
             timestamp=datetime.now(timezone.utc).isoformat(),
             model_device=str(device),
             model_ticker=model_ticker,
+            fundamentals=fund,
+            has_news=has_news  # New field
         )
 
     except HTTPException:
@@ -442,6 +452,35 @@ async def predict_price(req: PredictionRequest):
         logger.error(f"  ❌ Prediction failed for {req.ticker}: {e}")
         import traceback
         traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Market Scanner ───────────────────────────────────────────────────
+@app.post("/scan_market", tags=["Scanner"])
+async def scan_market_endpoint(payload: dict):
+    """
+    Scans a list of tickers for Sentiment + Fundamentals.
+    Payload: {"tickers": ["AAPL", "NVDA", ...]}
+    """
+    from scanner import MarketScanner
+    
+    tickers = payload.get("tickers", [])
+    if not tickers:
+        raise HTTPException(status_code=400, detail="No tickers provided")
+        
+    try:
+        scanner = MarketScanner(tickers)
+        df = scanner.scan_market()
+        
+        if df.empty:
+            return {"results": []}
+            
+        # Nan replace for JSON safety
+        df = df.fillna(0.0)
+        return {"results": df.to_dict(orient="records")}
+        
+    except Exception as e:
+        logger.error(f"Scanner failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -467,11 +506,15 @@ async def get_history(
 
         points = []
         for ts, row in df.iterrows():
+            # Handle has_news if it exists, default False
+            has_news = bool(row["has_news"]) if "has_news" in row else (row["Sentiment"] != 0.0)
+
             points.append(HistoryPoint(
                 timestamp=str(ts),
                 close=round(float(row["Close"]), 2),
                 volume=round(float(row["Volume"]), 2),
                 sentiment=round(float(row["Sentiment"]), 4),
+                has_news=has_news,
             ))
 
         return HistoryResponse(

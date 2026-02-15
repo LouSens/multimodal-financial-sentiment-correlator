@@ -20,10 +20,11 @@ class MarketScanner:
         else:
             self.tickers = tickers
 
+
     def scan_market(self):
         """
-        Iterate over tickers, fetch their latest news, and aggregate sentiment.
-        Returns a DataFrame sorted by sentiment.
+        Iterate over tickers, fetch their latest news + fundamentals.
+        Returns a DataFrame sorted by composite score (Sentiment + Fundamentals hint).
         """
         results = []
         
@@ -32,40 +33,66 @@ class MarketScanner:
             try:
                 loader = MarketDataLoader(ticker)
                 
-                # We specifically want the raw news DF here, not the aligned time-series
+                # 1. Fetch Fundamentals (Tri-Modal)
+                fund = loader.get_fundamentals()
+                
+                # 2. Fetch News & Score
                 news_df = loader._fetch_yfinance_news()
                 
-                if news_df is None or news_df.empty:
-                    continue
+                avg_sentiment = 0.0
+                num_articles = 0
+                top_story = {"headline": "No recent news", "summary": "", "provider": "", "url": ""}
+                
+                if news_df is not None and not news_df.empty:
+                    # Enforce "Content" check:
+                    # Filter out items with very short summaries to improve reliability
+                    news_df["content_len"] = news_df["summary"].astype(str).apply(len)
+                    valid_news = news_df[news_df["content_len"] > 20].copy()
                     
-                # Score them (using loader's text scorer directly or via pipeline)
-                # To be efficient, let's reuse loader logic but manually to keep details
-                
-                # Make sure we have the full text column
-                news_df["text_to_score"] = news_df["headline"] + ". " + news_df["summary"]
-                
-                # Predict
-                news_df["sentiment"] = news_df["text_to_score"].apply(loader._score_sentiment)
-                
-                # Aggregate
-                avg_sentiment = news_df["sentiment"].mean()
-                num_articles = len(news_df)
-                
-                # Get the "Most Impactful" story (furthest from neutral)
-                # i.e., max absolute sentiment
-                news_df["abs_sent"] = news_df["sentiment"].abs()
-                best_story_idx = news_df["abs_sent"].idxmax()
-                top_story = news_df.loc[best_story_idx]
-                
+                    if valid_news.empty:
+                         # Fallback to all if strict filtering leaves nothing
+                         valid_news = news_df.copy()
+
+                    # Score them
+                    valid_news["text_to_score"] = valid_news["headline"] + ". " + valid_news["summary"]
+                    valid_news["sentiment"] = valid_news["text_to_score"].apply(loader._score_sentiment)
+                    
+                    # Weighted Average? 
+                    # For now, simple arithmetic mean is robust enough
+                    avg_sentiment = valid_news["sentiment"].mean()
+                    num_articles = len(valid_news)
+                    
+                    # representative story
+                    valid_news["abs_sent"] = valid_news["sentiment"].abs()
+                    best_story_idx = valid_news["abs_sent"].idxmax()
+                    top_row = valid_news.loc[best_story_idx]
+                    top_story = {
+                        "headline": top_row["headline"],
+                        "summary": top_row["summary"],
+                        "provider": top_row["provider"],
+                        "url": top_row["url"]
+                    }
+
+                # Construct result row with EXTENDED metrics
                 results.append({
                     "Ticker": ticker,
                     "Sentiment Score": avg_sentiment,
                     "Sentiment Label": self._get_label(avg_sentiment),
                     "Articles": num_articles,
+                    
+                    # Top Story
                     "Top Headline": top_story["headline"],
                     "Top Summary": top_story["summary"],
                     "Provider": top_story["provider"],
-                    "URL": top_story["url"]
+                    "URL": top_story["url"],
+                    
+                    # Fundamentals
+                    "Market Cap": fund.get("market_cap"),
+                    "P/E Ratio": fund.get("trailing_pe"),
+                    "Recommendation": fund.get("recommendation_key", "N/A").replace("_", " ").title(),
+                    "ROE": fund.get("roe"),
+                    "Debt/Eq": fund.get("debt_to_equity"),
+                    "Profit Margin": fund.get("profit_margins")
                 })
                 
             except Exception as e:
@@ -76,6 +103,8 @@ class MarketScanner:
             return pd.DataFrame()
             
         df = pd.DataFrame(results)
+        # Sort by sentiment magnitude (absolute interest) or just raw score?
+        # Let's sort by raw score descending (Bullish first)
         df = df.sort_values("Sentiment Score", ascending=False).reset_index(drop=True)
         return df
 
@@ -85,5 +114,6 @@ class MarketScanner:
         return "Neutral 🟡"
 
 if __name__ == "__main__":
-    scanner = MarketScanner(["AAPL", "TSLA"])
-    print(scanner.scan_market())
+    scanner = MarketScanner(["AAPL", "NVDA"])
+    df = scanner.scan_market()
+    print(df[["Ticker", "Sentiment Score", "P/E Ratio", "Recommendation"]])

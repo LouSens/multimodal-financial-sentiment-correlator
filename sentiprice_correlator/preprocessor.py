@@ -212,6 +212,10 @@ class DataPreprocessor:
         # 2. Feature engineering
         df = self._engineer_features(df)
 
+        # Drop metadata columns that are not model features
+        if "has_news" in df.columns:
+            df = df.drop(columns=["has_news"])
+
         # Store feature metadata
         self.feature_names = list(df.columns)
         self._n_features = len(self.feature_names)
@@ -281,6 +285,10 @@ class DataPreprocessor:
 
         df = self._clean(df)
         df = self._engineer_features(df)
+
+        # Drop metadata columns that are not model features
+        if "has_news" in df.columns:
+            df = df.drop(columns=["has_news"])
 
         self.feature_names = list(df.columns)
         self._n_features = len(self.feature_names)
