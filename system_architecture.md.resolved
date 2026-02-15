@@ -1,0 +1,79 @@
+# Sentiprice Correlator: System Architecture & Deep Dive
+
+## 🧠 The "Brain": Tri-Modal Fusion
+The system is designed around a **Tri-Modal** philosophy. It believes that market moves are driven by three distinct forces, and it attempts to correllate them:
+
+1.  **Technical (The "What")**:
+    *   **Source**: [yfinance](file:///c:/Users/David/multimodal-financial-sentiment/multimodal-financial-sentiment-correlator/sentiprice_correlator/data_loader.py#69-142) (Price, Volume).
+    *   **Processing**: [preprocessor.py](file:///c:/Users/David/multimodal-financial-sentiment/multimodal-financial-sentiment-correlator/sentiprice_correlator/preprocessor.py) calculates Returns, Volatility (Rolling StdDev), and Volume Spikes.
+    *   **Role**: Provides the immediate trend and momentum context.
+
+2.  **Sentiment (The "Why")**:
+    *   **Source**: [yfinance](file:///c:/Users/David/multimodal-financial-sentiment/multimodal-financial-sentiment-correlator/sentiprice_correlator/data_loader.py#69-142) News (Headlines + Summaries).
+    *   **Processing**: [scanner.py](file:///c:/Users/David/multimodal-financial-sentiment/multimodal-financial-sentiment-correlator/sentiprice_correlator/scanner.py) uses distinct BERT-based scoring. It filters for content length (>20 chars) to avoid noise.
+    *   **Alignment**: [data_loader.py](file:///c:/Users/David/multimodal-financial-sentiment/multimodal-financial-sentiment-correlator/sentiprice_correlator/data_loader.py) aligns this disparate news data to hourly price candles using a `merge_asof` with a **48-hour backward lookahead**. This ensures that even if news happened yesterday, the model "remembers" it for today's open.
+    *   **Role**: Acts as a "regulator" or "bias" for the technical trend. Positive news can amplify a breakout; negative news can dampen it.
+
+3.  **Fundamental (The "Value")**:
+    *   **Source**: `yfinance.Ticker.info` (P/E, ROE, Margins, Analyst Recs).
+    *   **Processing**: Fetched on-demand via `/scan_market` and `/predict`.
+    *   **Role**: Provides a "Red Light / Green Light" context. A strong technical setup might be invalidated if the company has -50% Profit Margins or a "Sell" rating.
+
+---
+
+## 🏗️ System Architecture
+
+### 1. Data Layer ([data_loader.py](file:///c:/Users/David/multimodal-financial-sentiment/multimodal-financial-sentiment-correlator/sentiprice_correlator/data_loader.py) & [scanner.py](file:///c:/Users/David/multimodal-financial-sentiment/multimodal-financial-sentiment-correlator/sentiprice_correlator/scanner.py))
+*   **The Challenge**: Financial data is messy. Prices are regular (OHLCV), but News is sporadic (timestamped events).
+*   **The Solution**: [MarketDataLoader](file:///c:/Users/David/multimodal-financial-sentiment/multimodal-financial-sentiment-correlator/sentiprice_correlator/data_loader.py#26-368) handles the heavy lifting of **Alignment**.
+    *   It pulls Price Data (Regular Time Series).
+    *   It pulls News Data (Irregular Events).
+    *   It uses `pandas.merge_asof` to project the most recent news sentiment onto every single price candle.
+    *   **Improvement**: We recently relaxed the tolerance to 48h to prevent "All Neutral" dead zones.
+
+### 2. Preprocessing Layer ([preprocessor.py](file:///c:/Users/David/multimodal-financial-sentiment/multimodal-financial-sentiment-correlator/sentiprice_correlator/preprocessor.py))
+*   **Robustness**: We use `RobustScaler` instead of `MinMaxScaler`. Financial data has massive outliers (black swan events). `RobustScaler` uses the IQR (25th-75th quartile) so outliers don't squash the rest of the data.
+*   **Feature Engineering**: The raw price isn't enough. We engineer:
+    *   `Volatility`: Is the market calm or panicking?
+    *   `Sentiment_MA`: Is the news getting better or worse? (Momentum)
+    *   `Hour_Sin`: Cyclical time encoding (markets behave differently at Open vs Close).
+
+### 3. Model Layer ([model.py](file:///c:/Users/David/multimodal-financial-sentiment/multimodal-financial-sentiment-correlator/sentiprice_correlator/model.py) & [main.py](file:///c:/Users/David/multimodal-financial-sentiment/multimodal-financial-sentiment-correlator/sentiprice_correlator/main.py))
+*   **Architecture**: [MultiModalNet](file:///c:/Users/David/multimodal-financial-sentiment/multimodal-financial-sentiment-correlator/sentiprice_correlator/model.py#67-207) (LSTM + Linear).
+    *   **LSTM**: Processes the time-series (Price + Sentiment History). It has "memory" to understand trends.
+    *   **Dynamic Loading**: [main.py](file:///c:/Users/David/multimodal-financial-sentiment/multimodal-financial-sentiment-correlator/sentiprice_correlator/main.py) is smart. It doesn't load all models at once. It loads them **Lazy** (on first request) and caches them. This saves RAM.
+
+### 4. Interactive Layer ([dashboard.py](file:///c:/Users/David/multimodal-financial-sentiment/multimodal-financial-sentiment-correlator/sentiprice_correlator/dashboard.py) & [main.py](file:///c:/Users/David/multimodal-financial-sentiment/multimodal-financial-sentiment-correlator/sentiprice_correlator/main.py) API)
+*   **Decoupled Design**: The Dashboard is "dumb"; the API is "smart".
+    *   The Dashboard does NO data processing. It just asks the API: *"Give me the prediction"*.
+    *   This means you can swap the Dashboard for a Mobile App or a React Web App later without changing the backend logic.
+
+---
+
+## 🚀 Roadmap: What Can Be Improved?
+
+You have a solid **MVP (Minimum Viable Product)**. To make this "Hedge Fund Grade", here is the path forward:
+
+### Phase 1: Model Intelligence (The Engine)
+1.  **Transformer / Attention**:
+    *   *Why*: LSTMs are good, but **Transformers** (like GPT) are better at understanding context over long periods.
+    *   *Action*: Replace [MultiModalNet](file:///c:/Users/David/multimodal-financial-sentiment/multimodal-financial-sentiment-correlator/sentiprice_correlator/model.py#67-207) with a `TimeSeiresTransformer`. It can pay attention to specific news events in the past more effectively.
+2.  **Multi-Timeframe Analysis**:
+    *   *Why*: Currently, we only look at 1H candles.
+    *   *Action*: Feed the model *Daily* and *Weekly* trends simultaneously. A 1H breakout is stronger if the Daily trend is also up.
+
+### Phase 2: Data Infrastructure (The Fuel)
+3.  **Real Database (Postgres/TimescaleDB)**:
+    *   *Why*: [yfinance](file:///c:/Users/David/multimodal-financial-sentiment/multimodal-financial-sentiment-correlator/sentiprice_correlator/data_loader.py#69-142) is slow and rate-limited. In-memory caching isn't persistent.
+    *   *Action*: Store historical data in a database. Only fetch *new* data from [yfinance](file:///c:/Users/David/multimodal-financial-sentiment/multimodal-financial-sentiment-correlator/sentiprice_correlator/data_loader.py#69-142). This allows for instant backtesting and faster dashboards.
+4.  **Alternative Data Sources**:
+    *   *Why*: [yfinance](file:///c:/Users/David/multimodal-financial-sentiment/multimodal-financial-sentiment-correlator/sentiprice_correlator/data_loader.py#69-142) news is limited.
+    *   *Action*: Integrate Twitter/X Sentiment (via API) or Reddit (WallStreetBets) scraping for "Retail Sentiment".
+
+### Phase 3: Actionability (The Steering)
+5.  **Portfolio Optimizer**:
+    *   *Why*: Predicting one stock is good. Managing a basket is better.
+    *   *Action*: Build a module that takes the Scanner results and suggests an **Allocation** (e.g., "Buy 30% NVDA, 20% AMD, Short INTEL") based on the Sharpe Ratio (Risk vs Reward).
+6.  **Paper Trading Loop**:
+    *   *Why*: Validation.
+    *   *Action*: Connect to a broker API (Alpaca/Interactive Brokers) in "Paper Mode" to place trade based on predictions and track *real* P&L over time.
